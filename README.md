@@ -1,5 +1,10 @@
 # ui-level
 
+[![npm version](https://img.shields.io/npm/v/ui-level.svg?style=flat-square)](https://www.npmjs.com/package/ui-level)
+[![npm downloads](https://img.shields.io/npm/dt/ui-level.svg?style=flat-square)](https://www.npmjs.com/package/ui-level)
+[![CI](https://github.com/abolfazl-moeini/ui-level/actions/workflows/ci.yml/badge.svg)](https://github.com/abolfazl-moeini/ui-level/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+
 > Deterministic visual, DOM geometry, and computed CSS regression engine for HTML, Figma, and PNG/SVG references.
 
 `ui-level` eliminates vision-LLM guesswork (patch quantization, downscaling blindness, and hallucinated CSS values) by combining two deterministic verification gates:
