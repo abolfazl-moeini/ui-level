@@ -1,27 +1,29 @@
 # ui-level
 
-> Deterministic visual & CSS computed style regression engine.
+> Deterministic visual, DOM geometry, and computed CSS regression engine for HTML, Figma, and PNG/SVG references.
 
-`ui-level` is an open-source tool for testing UI implementations against designs (HTML, Figma, or PNG/SVG images) with zero hallucination.
+`ui-level` eliminates vision-LLM guesswork (patch quantization, downscaling blindness, and hallucinated CSS values) by combining two deterministic verification gates:
 
-Instead of relying on fuzzy vision LLMs that suffer from patch quantization and downscaling errors, `ui-level` uses a two-gate deterministic verification model:
-1. **Gate 1: DOM & Computed Styles Inspection** (Chromium CDP): Compares exact longhand CSS dimensions, typography, and perceptual color differences ($\Delta E_{00}$).
-2. **Gate 2: SIMD-Accelerated Pixel Diffing** (`odiff-bin`): Computes pixel-level divergence, masking out dynamic regions or text (when comparing Skia vs CoreText text engines).
+1. **Gate 1 — DOM, Geometry & Computed Styles (Chromium + Lazy CDP):**
+   Normalizes longhand CSS properties (`padding*`, `margin*`, `border*`, `fontSize`, `lineHeight`, `fontWeight`, `letterSpacing`, `fontFamily`), checks perceptual color drift via **CIEDE2000** ($\Delta E_{00}$), validates line wrapping (`renderedLines`) and `textContent`, and lazily queries Chrome DevTools Protocol (`CSS.styleSheetAdded` + `CSS.getMatchedStylesForNode`) on violations to pinpoint the winning CSS rule, file, and line number.
+2. **Gate 2 — SIMD Pixel Diff & Hotspot Correlation (`odiff-bin` + `sharp`):**
+   Runs SIMD-accelerated pixel comparison at device scale (`2x` or auto-detected `1x`), masks dynamic selectors or Figma text regions (to avoid Skia vs CoreText font-shaping noise), pads dimension drift with magenta sentinels, produces a 1:1 `Ref | Live | Diff` triplet (`triplet.png`), and clusters pixel discrepancies into CSS-coordinate `regions` mapped to overlapping DOM selectors and sampled RGB/$\Delta E_{00}$ deltas.
 
 ---
 
-## Installation
+## Requirements & Installation
+
+- Node.js `>= 20`
+- Chromium (system Chrome/Chromium or Playwright Chromium)
 
 ```bash
-# Direct run via npx
+# Run diagnostics
 npx ui-level doctor
 
-# Or install locally
+# Install locally or globally
 npm install -D ui-level
-```
 
-To install Chromium browser dependencies:
-```bash
+# Install Chromium if not already present on the machine
 npx ui-level setup
 ```
 
@@ -29,20 +31,31 @@ npx ui-level setup
 
 ## Quick Start
 
-### 1. HTML vs HTML Comparison
-Compare your local implementation against a reference HTML mockup:
+### 1. HTML vs HTML (Mockup / Exported HTML vs Live Site)
+Compare a live page against an exported HTML mockup (supports different root selectors via `--ref-selector` and automatic 4-tier node matching):
+
 ```bash
-npx ui-level check --target dist/index.html --ref designs/mockup.html --selector "#header"
+npx ui-level check \
+  --target http://localhost:3000 \
+  --ref designs/mockup.html \
+  --selector ".product-card" \
+  --ref-selector ".exported-card"
 ```
 
-### 2. Implementation vs Image (PNG or SVG)
-Compare a live page against a reference design image:
+### 2. Implementation vs PNG or SVG Screenshot
+Supports both `2x` Retina and `1x` standard PNGs (auto-detected) as well as `.svg` files rendered inside Chromium for full `@font-face` and RTL ligature fidelity:
+
 ```bash
-npx ui-level check --target http://localhost:3000 --ref designs/hero.svg --adapter image --selector ".hero"
+npx ui-level check \
+  --target http://localhost:3000 \
+  --ref designs/hero.svg \
+  --adapter image \
+  --selector ".hero"
 ```
 
 ### 3. Implementation vs Figma Node
-Compare directly against a Figma node using the Figma REST API:
+Compares directly against a Figma node (`use_absolute_bounds=true` + best-effort `/variables/local` + text masking in pixel diff):
+
 ```bash
 export FIGMA_TOKEN="figd_..."
 npx ui-level check \
@@ -52,16 +65,39 @@ npx ui-level check \
   --selector "#navbar"
 ```
 
+Or offline with exported spec/image files (e.g. from Figma MCP):
+
+```bash
+npx ui-level check \
+  --target http://localhost:3000 \
+  --adapter figma \
+  --ref-spec figma-node.json \
+  --ref-image figma-node.png \
+  --selector "#navbar"
+```
+
+---
+
+## Warm Daemon Mode
+
+Avoid cold Chromium startup overhead across repeated checks using the HTTP-over-Unix-Domain-Socket daemon (`/tmp/ui-level-<uid>/d.sock`, `0600` permissions, 10-minute idle TTL):
+
+```bash
+npx ui-level daemon start
+npx ui-level check --daemon --target dist/index.html --ref ref.html --selector "#card"
+npx ui-level daemon stop
+```
+
 ---
 
 ## Configuration (`ui-level.config.json`)
 
 Generate a starter configuration:
+
 ```bash
 npx ui-level init
 ```
 
-Example configuration:
 ```json
 {
   "targetUrl": "index.html",
@@ -75,6 +111,7 @@ Example configuration:
   "threshold": 0.05,
   "colorThresholdDeltaE": 2.0,
   "geometryTolerancePx": 0.5,
+  "subpixelTolerancePx": 1.0,
   "selector": "body",
   "maskSelectors": [".dynamic-timestamp", ".user-avatar"],
   "outputDir": ".ui-level"
@@ -85,7 +122,7 @@ Example configuration:
 
 ## MCP Server (Model Context Protocol)
 
-`ui-level` includes a built-in stdio MCP server for agentic AI tools (Claude Code, Cursor, Antigravity):
+Expose `level_check` and `level_doctor` over `stdio` for Claude Code, Cursor, or Antigravity:
 
 ```json
 {
@@ -98,15 +135,10 @@ Example configuration:
 }
 ```
 
-Exposed MCP Tools:
-- `level_check`: Runs visual and CSS spec verification and returns a structured `DeltaPacket`.
-- `level_doctor`: Diagnoses local browser and diff engines.
-
 ---
 
-## Output (`DeltaPacket`)
+## Structured Output (`--json`)
 
-When run with `--json`, `ui-level` outputs structured JSON:
 ```json
 {
   "status": "fail",
@@ -122,27 +154,50 @@ When run with `--json`, `ui-level` outputs structured JSON:
       "unit": "px",
       "cssRuleSource": {
         "file": "http://127.0.0.1:54321/css/main.css",
-        "line": 142
+        "line": 142,
+        "column": 5,
+        "selector": ".btn",
+        "cssText": "padding: 18px;"
       },
       "fixHint": "Set 'paddingLeft' to 16px (currently 18px, drift: +2px)"
     }
   ],
   "pixelDiff": {
     "match": false,
-    "diffCount": 42,
-    "diffPercentage": 0.05,
+    "diffCount": 1420,
+    "diffPercentage": 1.85,
     "dimensionDrift": false,
-    "tripletImagePath": ".ui-level/triplet.png"
+    "tripletImagePath": ".ui-level/triplet.png",
+    "regions": [
+      {
+        "x": 233,
+        "y": 81,
+        "width": 87,
+        "height": 36,
+        "pixelCount": 1420,
+        "overlappingSelectors": ["#card-btn", "#test-card"],
+        "refColor": "rgb(37, 99, 235)",
+        "liveColor": "rgb(220, 38, 38)",
+        "deltaE": 54.2
+      }
+    ]
   }
 }
 ```
 
-Exit Codes:
-- `0`: PASS (All style, geometry, and pixel gates matched).
-- `1`: FAIL (Regressions or visual differences detected).
-- `2`: ERROR (System, network, or configuration error).
+### Exit Codes
+- `0`: PASS — all style, geometry, and pixel gates matched.
+- `1`: FAIL — visual or style regressions detected.
+- `2`: ERROR — invalid config, missing target, or runtime error.
 
 ---
+
+## Docker
+
+```bash
+docker build -t ui-level .
+docker run --rm ui-level doctor
+```
 
 ## License
 

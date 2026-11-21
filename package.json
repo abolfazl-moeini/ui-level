@@ -1,9 +1,30 @@
 {
   "name": "ui-level",
   "version": "1.0.0",
-  "description": "Deterministic visual & CSS spec regression engine for modern UI workflows",
-  "author": "ui-level contributors",
+  "description": "Deterministic visual & CSS spec regression engine for HTML, Figma, and PNG/SVG",
+  "author": "Abolfazl Moeini",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abolfazl-moeini/ui-level.git"
+  },
+  "homepage": "https://github.com/abolfazl-moeini/ui-level#readme",
+  "bugs": {
+    "url": "https://github.com/abolfazl-moeini/ui-level/issues"
+  },
+  "keywords": [
+    "visual-regression",
+    "ui-testing",
+    "figma",
+    "css",
+    "playwright",
+    "odiff",
+    "mcp",
+    "ciede2000"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "type": "module",
   "bin": {
     "ui-level": "./dist/cli.js"
@@ -21,7 +42,6 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE",
     "Dockerfile"
   ],
   "scripts": {
