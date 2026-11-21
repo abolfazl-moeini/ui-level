@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import sharp from "sharp";
 import type { Browser, BrowserContext } from "playwright-core";
 import {
   ConfigSchema,
@@ -110,12 +111,49 @@ export async function check(
     }
 
     // 4. Extract Live Page Telemetry, Mask Rects & Live Screenshot
-    const liveTelemetry = await extractPageTelemetry(
+    let effectiveDpr = config.viewport.deviceScaleFactor;
+    let liveTelemetry = await extractPageTelemetry(
       page,
       config.selector,
       liveScreenshotPath,
       config.maskSelectors
     );
+
+    // Smart 1x Screenshot Support: if user supplied a 1x raster PNG/JPG/WEBP matching 1x CSS dimensions
+    // while DPR defaulted to 2, re-capture live at 1x DPR so 1x screenshots work without false DIMENSION_DRIFT.
+    const isRasterImageRef = Boolean(cleanRefPath && /\.(png|jpe?g|webp)$/i.test(cleanRefPath));
+    if (effectiveAdapter === "image" && isRasterImageRef && effectiveDpr === 2) {
+      const refImgMeta = await sharp(refResult.refScreenshotPath).metadata();
+      const refW = refImgMeta.width || 0;
+      const refH = refImgMeta.height || 0;
+      const cssW = Math.round(liveTelemetry.rootRect.width);
+      const cssH = Math.round(liveTelemetry.rootRect.height);
+      if (Math.abs(refW - cssW) <= 2 && Math.abs(refH - cssH) <= 2 && cssW > 0 && cssH > 0) {
+        effectiveDpr = 1;
+        refResult.spec.nodes[0].rect.width = refW;
+        refResult.spec.nodes[0].rect.height = refH;
+        const ctx1x = await browser.newContext({
+          viewport: { width: config.viewport.width, height: config.viewport.height },
+          deviceScaleFactor: 1,
+          ignoreHTTPSErrors: config.ignoreHttpsErrors,
+        });
+        try {
+          const p1x = await ctx1x.newPage();
+          await p1x.goto(targetUrl, { waitUntil: "networkidle", timeout: 30000 });
+          if (config.injectCss) {
+            await p1x.addStyleTag({ content: config.injectCss });
+          }
+          await p1x.locator(config.selector).first().screenshot({
+            animations: "disabled",
+            caret: "hide",
+            scale: "device",
+            path: liveScreenshotPath,
+          });
+        } finally {
+          await ctx1x.close();
+        }
+      }
+    }
 
     // 5. Gate 1: Deterministic Style & Geometry Check
     const { styleViolations, geometryViolations } = compareTelemetryWithSpec(
@@ -160,11 +198,12 @@ export async function check(
       diffOutputPath,
       {
         threshold: config.threshold,
-        dpr: config.viewport.deviceScaleFactor,
+        dpr: effectiveDpr,
         cropRect: liveTelemetry.rootRect,
         maskRects,
         adapter: effectiveAdapter,
         subpixelTolerancePx: config.subpixelTolerancePx,
+        liveNodes: liveTelemetry.nodes,
       }
     );
 

@@ -355,8 +355,19 @@ export function compareTelemetryWithSpec(
   const refMatchers = buildRefMatchers(refNodes);
   const usedRefs = new Set<NodeSpec>();
 
-  for (const live of liveNodes) {
-    const ref = resolveMatchedRef(live, refMatchers, usedRefs, config.selectorMap);
+  for (let i = 0; i < liveNodes.length; i++) {
+    const live = liveNodes[i];
+    let ref = resolveMatchedRef(live, refMatchers, usedRefs, config.selectorMap);
+    // Root auto-pairing: pair inspected root container with reference root frame/container (never hijack a text leaf)
+    if (
+      !ref &&
+      i === 0 &&
+      refNodes.length > 0 &&
+      !usedRefs.has(refNodes[0]) &&
+      refNodes[0].tagName !== "text"
+    ) {
+      ref = refNodes[0];
+    }
     if (!ref) continue;
     usedRefs.add(ref);
 

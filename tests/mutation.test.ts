@@ -274,4 +274,145 @@ describe("ui-level deterministic regression engine", () => {
     expect(autoImg.status).toBe("pass");
     expect(autoImg.adapter).toBe("image");
   });
+
+  it("Goal 1: matches Figma root frame & child text without data-figma-id attributes", async () => {
+    const g1Dir = path.join(outputDir, "goal1-figma-root");
+    fs.mkdirSync(g1Dir, { recursive: true });
+
+    await check(
+      {
+        targetUrl: baseHtml,
+        ref: baseHtml,
+        adapter: "html",
+        selector: "#test-card",
+        outputDir: path.join(g1Dir, "prep"),
+        root: fixturesDir,
+      },
+      browser
+    );
+    const refPng = path.join(g1Dir, "prep", "ref.png");
+    const refSpecPath = path.join(g1Dir, "figma-root.json");
+
+    // Root frame has expected paddingTop: 24 (live is 16) + text node matched by landmark text
+    const spec = {
+      adapter: "figma",
+      viewport: { width: 1280, height: 800, deviceScaleFactor: 2 },
+      nodes: [
+        {
+          id: "1:1",
+          figmaId: "1:1",
+          selector: '[data-figma-id="1:1"]',
+          tagName: "frame",
+          rect: { x: 0, y: 0, width: 354, height: 134 },
+          styles: { paddingTop: 24, backgroundColor: "rgb(255, 255, 255)" },
+        },
+        {
+          id: "1:2",
+          figmaId: "1:2",
+          selector: '[data-figma-id="1:2"]',
+          tagName: "text",
+          rect: { x: 17, y: 17, width: 320, height: 24 },
+          styles: { fontSize: 18, fontWeight: 700, color: "rgb(17, 24, 39)" },
+          text: "تست عنوان کارت",
+        },
+      ],
+    };
+    fs.writeFileSync(refSpecPath, JSON.stringify(spec, null, 2), "utf-8");
+
+    const res = await check(
+      {
+        targetUrl: baseHtml,
+        adapter: "figma",
+        selector: "#test-card",
+        refSpec: refSpecPath,
+        refImage: refPng,
+        outputDir: path.join(g1Dir, "run"),
+        root: fixturesDir,
+      },
+      browser
+    );
+
+    expect(res.status).toBe("fail");
+    const rootPad = res.styleViolations.find(
+      (v) => v.selector === "#test-card" && v.property === "paddingTop"
+    );
+    expect(rootPad).toBeDefined();
+    expect(rootPad?.expected).toBe(24);
+    expect(rootPad?.actual).toBe(16);
+  });
+
+  it("Goal 2: compares exported HTML with different refSelector and extra wrapper elements", async () => {
+    const g2Dir = path.join(outputDir, "goal2-exported-html");
+    fs.mkdirSync(g2Dir, { recursive: true });
+    const exportedHtml = path.join(g2Dir, "exported.html");
+    const liveWrappedHtml = path.join(g2Dir, "live-site.html");
+
+    fs.writeFileSync(
+      exportedHtml,
+      `<!DOCTYPE html><html><body style="margin:0"><div class="export-box" style="padding:16px;width:200px;background:#fff"><span class="cta" style="font-size:16px;color:#111">Buy Now</span></div></body></html>`
+    );
+    fs.writeFileSync(
+      liveWrappedHtml,
+      `<!DOCTYPE html><html><body style="margin:0"><section class="wp-block-card" style="padding:20px;width:200px;background:#fff"><div class="inner-wrap"><a class="wp-btn" style="font-size:16px;color:#111">Buy Now</a></div></section></body></html>`
+    );
+
+    const res = await check(
+      {
+        targetUrl: liveWrappedHtml,
+        ref: exportedHtml,
+        adapter: "html",
+        selector: ".wp-block-card",
+        refSelector: ".export-box",
+        outputDir: path.join(g2Dir, "run"),
+        root: g2Dir,
+      },
+      browser
+    );
+
+    expect(res.status).toBe("fail");
+    const padErr = res.styleViolations.find((v) => v.property === "paddingTop");
+    expect(padErr).toBeDefined();
+    expect(padErr?.expected).toBe(16);
+    expect(padErr?.actual).toBe(20);
+  });
+
+  it("Goal 3: auto-detects 1x PNG screenshot, pinpoints diffRegions over #card-btn, and samples RGB/dE00", async () => {
+    const g3Dir = path.join(outputDir, "goal3-png-hotspots");
+    fs.mkdirSync(g3Dir, { recursive: true });
+    const ref1xPng = path.join(g3Dir, "ref-1x.png");
+
+    // Create a genuine 1x screenshot from base.html
+    const ctx1x = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      deviceScaleFactor: 1,
+    });
+    const p1x = await ctx1x.newPage();
+    await p1x.setContent(fs.readFileSync(baseHtml, "utf-8"));
+    await p1x.locator("#test-card").screenshot({ animations: "disabled", path: ref1xPng });
+    await ctx1x.close();
+
+    // Compare 1x PNG against mutated_color.html (blue -> red button) at default DPR=2 config
+    const res = await check(
+      {
+        targetUrl: mutatedColorHtml,
+        ref: ref1xPng,
+        adapter: "image",
+        selector: "#test-card",
+        outputDir: path.join(g3Dir, "run"),
+        root: fixturesDir,
+      },
+      browser
+    );
+
+    expect(res.status).toBe("fail");
+    expect(res.pixelDiff.dimensionDrift).toBe(false);
+    expect(res.pixelDiff.regions).toBeDefined();
+    expect(res.pixelDiff.regions!.length).toBeGreaterThan(0);
+
+    const hotspot = res.pixelDiff.regions![0];
+    expect(hotspot.overlappingSelectors).toContain("#card-btn");
+    expect(hotspot.refColor).toBeDefined();
+    expect(hotspot.liveColor).toBeDefined();
+    expect(hotspot.deltaE).toBeGreaterThan(10);
+  });
 });

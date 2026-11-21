@@ -124,6 +124,20 @@ export const GeometryViolationSchema = z.object({
 
 export type GeometryViolation = z.infer<typeof GeometryViolationSchema>;
 
+export const DiffRegionSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+  pixelCount: z.number().int().nonnegative(),
+  overlappingSelectors: z.array(z.string()),
+  refColor: z.string().optional(),
+  liveColor: z.string().optional(),
+  deltaE: z.number().optional(),
+});
+
+export type DiffRegion = z.infer<typeof DiffRegionSchema>;
+
 export const PixelDiffSummarySchema = z.object({
   match: z.boolean(),
   diffCount: z.number().int().nonnegative(),
@@ -133,6 +147,7 @@ export const PixelDiffSummarySchema = z.object({
   liveDimensions: z.object({ width: z.number(), height: z.number() }),
   tripletImagePath: z.string().optional(),
   diffImagePath: z.string().optional(),
+  regions: z.array(DiffRegionSchema).optional(),
 });
 
 export type PixelDiffSummary = z.infer<typeof PixelDiffSummarySchema>;
@@ -166,6 +181,7 @@ export const ConfigSchema = z.object({
   geometryTolerancePx: z.number().nonnegative().default(0.5),
   subpixelTolerancePx: z.number().nonnegative().default(1.0),
   selector: z.string().default("body"),
+  refSelector: z.string().optional(),
   selectorMap: z.record(z.string(), z.string()).optional(),
   maskSelectors: z.array(z.string()).default([]),
   injectCss: z.string().optional(),

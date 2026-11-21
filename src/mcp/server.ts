@@ -57,6 +57,10 @@ export async function startMcpServer(): Promise<void> {
                 description: "CSS selector of the component to inspect (defaults to 'body')",
                 default: "body",
               },
+              refSelector: {
+                type: "string",
+                description: "Optional CSS selector in reference HTML (defaults to selector)",
+              },
               threshold: {
                 type: "number",
                 description: "Pixel diff threshold (0 to 1, default 0.05)",

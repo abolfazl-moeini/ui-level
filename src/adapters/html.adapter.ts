@@ -54,7 +54,8 @@ export async function processHTMLReference(
       await page.addStyleTag({ content: config.injectCss });
     }
 
-    const telemetry = await extractPageTelemetry(page, config.selector, refScreenshotPath);
+    const targetSelector = config.refSelector || config.selector;
+    const telemetry = await extractPageTelemetry(page, targetSelector, refScreenshotPath);
 
     const spec: NormalizedSpec = {
       adapter: "html",

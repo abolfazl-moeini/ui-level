@@ -1,8 +1,9 @@
 import path from "node:path";
 import fs from "node:fs";
 import { compare, type ODiffOptions, type ODiffResult } from "odiff-bin";
-import type { GeometryRect, PixelDiffSummary } from "../schema.js";
+import type { GeometryRect, NodeSpec, PixelDiffSummary } from "../schema.js";
 import { normalizeImageDimensions } from "./triplet.js";
+import { extractDiffRegions } from "./regions.js";
 
 export interface PixelDiffOptions {
   threshold?: number;
@@ -13,6 +14,7 @@ export interface PixelDiffOptions {
   maskRects?: GeometryRect[];
   adapter?: "html" | "figma" | "image";
   subpixelTolerancePx?: number;
+  liveNodes?: NodeSpec[];
 }
 
 export function transformRectsToIgnoreRegions(
@@ -126,6 +128,18 @@ export async function runPixelDiff(
     match = false;
   }
 
+  const diffExists = fs.existsSync(diffOutputPath);
+  const regions =
+    !match && diffExists
+      ? await extractDiffRegions(
+          diffOutputPath,
+          normResult.refPath,
+          normResult.livePath,
+          options.dpr || 2,
+          options.liveNodes || []
+        )
+      : undefined;
+
   return {
     match,
     diffCount,
@@ -133,6 +147,7 @@ export async function runPixelDiff(
     dimensionDrift,
     refDimensions,
     liveDimensions,
-    diffImagePath: fs.existsSync(diffOutputPath) ? diffOutputPath : undefined,
+    diffImagePath: diffExists ? diffOutputPath : undefined,
+    ...(regions && regions.length > 0 ? { regions } : {}),
   };
 }

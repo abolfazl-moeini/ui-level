@@ -75,8 +75,10 @@ program
   .option("-r, --ref <url|file|key>", "Reference HTML, image, or Figma node/URL")
   .option("-a, --adapter <type>", "Adapter type: html, figma, image")
   .option("-s, --selector <css>", "CSS selector to inspect")
+  .option("--ref-selector <css>", "CSS selector in reference HTML (defaults to --selector)")
   .option("--threshold <number>", "Pixel diff threshold (0.0 to 1.0)", parseFloat)
   .option("--viewport <WxH>", "Viewport size, e.g. 1280x800")
+  .option("--dpr <number>", "Device scale factor (e.g. 1 or 2)", parseFloat)
   .option("-c, --config <path>", "Path to ui-level.config.json")
   .option("--mask <selectors...>", "Selectors to mask from pixel diff")
   .option("--inject-css <css>", "Custom CSS to inject into target page")
@@ -115,13 +117,17 @@ program
 
       const cliSet = (name: string) => cmd.getOptionValueSource(name) === "cli";
 
-      const mergedViewport = options.viewport
-        ? {
-            deviceScaleFactor: 2,
-            ...(fileConfig.viewport || {}),
-            ...parseViewportFlag(options.viewport),
-          }
-        : fileConfig.viewport;
+      const mergedViewport =
+        options.viewport || cliSet("dpr")
+          ? {
+              deviceScaleFactor: cliSet("dpr")
+                ? options.dpr
+                : fileConfig.viewport?.deviceScaleFactor ?? 2,
+              width: fileConfig.viewport?.width ?? 1280,
+              height: fileConfig.viewport?.height ?? 800,
+              ...(options.viewport ? parseViewportFlag(options.viewport) : {}),
+            }
+          : fileConfig.viewport;
 
       const mergedConfig: Partial<UILevelConfig> = {
         ...fileConfig,
@@ -129,6 +135,7 @@ program
         ref: cliSet("ref") ? options.ref : fileConfig.ref,
         adapter: cliSet("adapter") ? (options.adapter as any) : fileConfig.adapter || "html",
         selector: cliSet("selector") ? options.selector : fileConfig.selector || "body",
+        refSelector: cliSet("refSelector") ? options.refSelector : fileConfig.refSelector,
         threshold: cliSet("threshold") ? options.threshold : fileConfig.threshold,
         maskSelectors: cliSet("mask")
           ? [...(fileConfig.maskSelectors || []), ...(options.mask || [])]
@@ -408,6 +415,19 @@ function renderHumanReport(packet: DeltaPacket): void {
   console.log(`  Dimension Drift: ${packet.pixelDiff.dimensionDrift ? "YES" : "NO"}`);
   if (packet.pixelDiff.tripletImagePath) {
     console.log(`  Triplet:         ${packet.pixelDiff.tripletImagePath}`);
+  }
+  if (packet.pixelDiff.regions && packet.pixelDiff.regions.length > 0) {
+    console.log(`\n\x1b[33mGate 2: Diff Hotspots (${packet.pixelDiff.regions.length}):\x1b[0m`);
+    for (const r of packet.pixelDiff.regions) {
+      const selList = r.overlappingSelectors.length > 0 ? r.overlappingSelectors.join(", ") : "unknown";
+      const colorInfo =
+        r.refColor && r.liveColor
+          ? ` | Ref: ${r.refColor} vs Live: ${r.liveColor} (ΔE00=${r.deltaE ?? "?"})`
+          : "";
+      console.log(
+        `  - [${r.x}, ${r.y}, ${r.width}x${r.height} CSS px] (${r.pixelCount} px) -> ${selList}${colorInfo}`
+      );
+    }
   }
 
   console.log(`\n${color}${icon} ${packet.summary}${reset}\n`);
