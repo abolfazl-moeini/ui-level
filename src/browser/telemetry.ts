@@ -1,4 +1,4 @@
-import type { Page, Locator } from "playwright-core";
+import type { Page } from "playwright-core";
 import type {
   GeometryRect,
   GeometryViolation,
@@ -12,72 +12,84 @@ import { compareColors } from "../diff/color.js";
 export interface TelemetryExtractionResult {
   nodes: NodeSpec[];
   rootRect: GeometryRect;
+  maskRects: GeometryRect[];
   screenshotBuffer: Buffer;
 }
 
 export async function extractPageTelemetry(
   page: Page,
   rootSelector: string = "body",
-  screenshotPath?: string
+  screenshotPath?: string,
+  maskSelectors: string[] = []
 ): Promise<TelemetryExtractionResult> {
   const locator = page.locator(rootSelector).first();
   await locator.waitFor({ state: "attached", timeout: 10000 });
 
-  // 1. Evaluate telemetry in browser context in one batched pass
-  const extraction = await locator.evaluate((rootEl: Element) => {
-    function parsePx(val: string | null | undefined): number {
-      if (!val) return 0;
-      const num = parseFloat(val);
-      return isNaN(num) ? 0 : num;
-    }
+  // Evaluate DOM telemetry AND maskSelectors in a single pre-scroll pass
+  // so rootRect, textRects, and maskRects share the exact same viewport origin.
+  const extraction = await locator.evaluate(
+    (rootEl: Element, masks: string[]) => {
+      function parsePx(val: string | null | undefined): number | undefined {
+        if (!val || val === "normal" || val === "none" || val === "auto") return undefined;
+        const num = parseFloat(val);
+        return isNaN(num) ? undefined : num;
+      }
 
-    function parseFontWeight(val: string | null | undefined): number {
-      if (!val) return 400;
-      if (val === "bold") return 700;
-      if (val === "normal") return 400;
-      const num = parseInt(val, 10);
-      return isNaN(num) ? 400 : num;
-    }
+      function parseZeroDefaultPx(val: string | null | undefined): number {
+        if (!val || val === "normal" || val === "none" || val === "auto") return 0;
+        const num = parseFloat(val);
+        return isNaN(num) ? 0 : num;
+      }
 
-    function getUniqueSelector(el: Element, root: Element): string {
-      if (el.id) return `#${CSS.escape(el.id)}`;
-      if (el === root) return root.id ? `#${CSS.escape(root.id)}` : root.tagName.toLowerCase();
+      function parseFontWeight(val: string | null | undefined): number {
+        if (!val) return 400;
+        if (val === "bold") return 700;
+        if (val === "normal") return 400;
+        const num = parseInt(val, 10);
+        return isNaN(num) ? 400 : num;
+      }
 
-      const parts: string[] = [];
-      let cur: Element | null = el;
+      function getUniqueSelector(el: Element, root: Element): string {
+        if (el.id) return `#${CSS.escape(el.id)}`;
+        if (el === root) return root.id ? `#${CSS.escape(root.id)}` : root.tagName.toLowerCase();
 
-      while (cur && cur !== root && cur.parentElement) {
-        const parent = cur.parentElement;
-        const tag = cur.tagName.toLowerCase();
-        const siblings = Array.from(parent.children).filter((c) => c.tagName.toLowerCase() === tag);
+        const parts: string[] = [];
+        let cur: Element | null = el;
 
-        if (siblings.length > 1) {
-          const index = siblings.indexOf(cur) + 1;
-          parts.unshift(`${tag}:nth-of-type(${index})`);
-        } else {
-          parts.unshift(tag);
+        while (cur && cur !== root && cur.parentElement) {
+          const parentEl: Element = cur.parentElement;
+          const tag = cur.tagName.toLowerCase();
+          const siblings = Array.from(parentEl.children).filter(
+            (c: Element) => c.tagName.toLowerCase() === tag
+          );
+
+          if (siblings.length > 1) {
+            const index = siblings.indexOf(cur) + 1;
+            parts.unshift(`${tag}:nth-of-type(${index})`);
+          } else {
+            parts.unshift(tag);
+          }
+          cur = parentEl;
         }
-        cur = parent;
+
+        if (cur === root) {
+          const rootTag = root.tagName.toLowerCase();
+          parts.unshift(root.id ? `#${CSS.escape(root.id)}` : rootTag);
+        }
+
+        return parts.join(" > ");
       }
 
-      if (cur === root) {
-        const rootTag = root.tagName.toLowerCase();
-        parts.unshift(root.id ? `#${CSS.escape(root.id)}` : rootTag);
-      }
-
-      return parts.join(" > ");
-    }
-
-    function getTextRects(el: Element): Array<{ x: number; y: number; width: number; height: number }> {
-      const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
-      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-      let node = walker.nextNode();
-
-      while (node) {
-        const text = node.textContent?.trim();
-        if (text && text.length > 0) {
+      function getTextRects(
+        el: Element
+      ): Array<{ x: number; y: number; width: number; height: number }> {
+        const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
+        for (const child of Array.from(el.childNodes)) {
+          if (child.nodeType !== Node.TEXT_NODE) continue;
+          const text = child.textContent?.trim();
+          if (!text || text.length === 0) continue;
           const range = document.createRange();
-          range.selectNodeContents(node);
+          range.selectNodeContents(child);
           const clientRects = range.getClientRects();
           for (let i = 0; i < clientRects.length; i++) {
             const r = clientRects[i];
@@ -91,100 +103,140 @@ export async function extractPageTelemetry(
             }
           }
         }
-        node = walker.nextNode();
+        return rects;
       }
-      return rects;
-    }
 
-    const rootBcr = rootEl.getBoundingClientRect();
-    const rootRect = {
-      x: rootBcr.left,
-      y: rootBcr.top,
-      width: rootBcr.width,
-      height: rootBcr.height,
-    };
+      function countRenderedLines(
+        textRects: Array<{ x: number; y: number; width: number; height: number }>
+      ): number {
+        if (textRects.length === 0) return 0;
+        const lineTops: number[] = [];
+        for (const r of textRects) {
+          if (!lineTops.some((y) => Math.abs(y - r.y) <= 3)) {
+            lineTops.push(r.y);
+          }
+        }
+        return lineTops.length;
+      }
 
-    const allElements: Element[] = [rootEl, ...Array.from(rootEl.querySelectorAll("*"))];
-    const nodes: NodeSpec[] = [];
-
-    for (const el of allElements) {
-      const bcr = el.getBoundingClientRect();
-      // Skip invisible elements
-      if (bcr.width <= 0 && bcr.height <= 0) continue;
-
-      const cs = window.getComputedStyle(el);
-      if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") continue;
-
-      const selector = getUniqueSelector(el, rootEl);
-      const textRects = getTextRects(el);
-      const directText = Array.from(el.childNodes)
-        .filter((n) => n.nodeType === Node.TEXT_NODE)
-        .map((n) => n.textContent?.trim())
-        .filter(Boolean)
-        .join(" ");
-
-      const styles: StyleSpec = {
-        paddingTop: parsePx(cs.paddingTop),
-        paddingRight: parsePx(cs.paddingRight),
-        paddingBottom: parsePx(cs.paddingBottom),
-        paddingLeft: parsePx(cs.paddingLeft),
-
-        marginTop: parsePx(cs.marginTop),
-        marginRight: parsePx(cs.marginRight),
-        marginBottom: parsePx(cs.marginBottom),
-        marginLeft: parsePx(cs.marginLeft),
-
-        borderTopWidth: parsePx(cs.borderTopWidth),
-        borderRightWidth: parsePx(cs.borderRightWidth),
-        borderBottomWidth: parsePx(cs.borderBottomWidth),
-        borderLeftWidth: parsePx(cs.borderLeftWidth),
-
-        borderTopLeftRadius: parsePx(cs.borderTopLeftRadius),
-        borderTopRightRadius: parsePx(cs.borderTopRightRadius),
-        borderBottomRightRadius: parsePx(cs.borderBottomRightRadius),
-        borderBottomLeftRadius: parsePx(cs.borderBottomLeftRadius),
-
-        rowGap: parsePx(cs.rowGap),
-        columnGap: parsePx(cs.columnGap),
-
-        fontSize: parsePx(cs.fontSize),
-        lineHeight: parsePx(cs.lineHeight),
-        fontWeight: parseFontWeight(cs.fontWeight),
-        letterSpacing: parsePx(cs.letterSpacing),
-        fontFamily: cs.fontFamily,
-
-        color: cs.color,
-        backgroundColor: cs.backgroundColor,
-
-        display: cs.display,
-        flexDirection: cs.flexDirection,
-        justifyContent: cs.justifyContent,
-        alignItems: cs.alignItems,
-
-        width: bcr.width,
-        height: bcr.height,
+      const rootBcr = rootEl.getBoundingClientRect();
+      const rootRect = {
+        x: rootBcr.left,
+        y: rootBcr.top,
+        width: rootBcr.width,
+        height: rootBcr.height,
       };
 
-      nodes.push({
-        id: el.id || selector,
-        selector,
-        tagName: el.tagName.toLowerCase(),
-        rect: {
-          x: bcr.left,
-          y: bcr.top,
+      // Resolve maskSelectors inside same synchronous snapshot before scrolling
+      const maskRects: Array<{ x: number; y: number; width: number; height: number }> = [];
+      for (const maskSel of masks) {
+        try {
+          const matched = document.querySelectorAll(maskSel);
+          matched.forEach((mEl) => {
+            const r = mEl.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              maskRects.push({
+                x: r.left,
+                y: r.top,
+                width: r.width,
+                height: r.height,
+              });
+            }
+          });
+        } catch {
+          // Ignore invalid CSS selectors in maskSelectors
+        }
+      }
+
+      const allElements: Element[] = [rootEl, ...Array.from(rootEl.querySelectorAll("*"))];
+      const nodes: NodeSpec[] = [];
+
+      for (const el of allElements) {
+        const bcr = el.getBoundingClientRect();
+        if (bcr.width <= 0 && bcr.height <= 0) continue;
+
+        const cs = window.getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") continue;
+
+        const selector = getUniqueSelector(el, rootEl);
+        const textRects = getTextRects(el);
+        const directText = Array.from(el.childNodes)
+          .filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => n.textContent?.trim())
+          .filter(Boolean)
+          .join(" ");
+
+        const styles: StyleSpec = {
+          paddingTop: parseZeroDefaultPx(cs.paddingTop),
+          paddingRight: parseZeroDefaultPx(cs.paddingRight),
+          paddingBottom: parseZeroDefaultPx(cs.paddingBottom),
+          paddingLeft: parseZeroDefaultPx(cs.paddingLeft),
+
+          marginTop: parseZeroDefaultPx(cs.marginTop),
+          marginRight: parseZeroDefaultPx(cs.marginRight),
+          marginBottom: parseZeroDefaultPx(cs.marginBottom),
+          marginLeft: parseZeroDefaultPx(cs.marginLeft),
+
+          borderTopWidth: parseZeroDefaultPx(cs.borderTopWidth),
+          borderRightWidth: parseZeroDefaultPx(cs.borderRightWidth),
+          borderBottomWidth: parseZeroDefaultPx(cs.borderBottomWidth),
+          borderLeftWidth: parseZeroDefaultPx(cs.borderLeftWidth),
+
+          borderTopLeftRadius: parseZeroDefaultPx(cs.borderTopLeftRadius),
+          borderTopRightRadius: parseZeroDefaultPx(cs.borderTopRightRadius),
+          borderBottomRightRadius: parseZeroDefaultPx(cs.borderBottomRightRadius),
+          borderBottomLeftRadius: parseZeroDefaultPx(cs.borderBottomLeftRadius),
+
+          rowGap: parseZeroDefaultPx(cs.rowGap),
+          columnGap: parseZeroDefaultPx(cs.columnGap),
+
+          fontSize: parsePx(cs.fontSize),
+          lineHeight: parsePx(cs.lineHeight),
+          fontWeight: parseFontWeight(cs.fontWeight),
+          letterSpacing: parseZeroDefaultPx(cs.letterSpacing),
+          fontFamily: cs.fontFamily,
+
+          color: cs.color,
+          backgroundColor: cs.backgroundColor,
+
+          display: cs.display,
+          flexDirection: cs.flexDirection,
+          justifyContent: cs.justifyContent,
+          alignItems: cs.alignItems,
+
           width: bcr.width,
           height: bcr.height,
-        },
-        styles,
-        text: directText || undefined,
-        textRects: textRects.length > 0 ? textRects : undefined,
-      });
-    }
+        };
 
-    return { nodes, rootRect };
-  });
+        const figmaId = el.getAttribute("data-figma-id") || undefined;
+        const classes = Array.from(el.classList);
 
-  // 2. Take component screenshot with animations disabled and device scale
+        nodes.push({
+          id: el.id || selector,
+          figmaId,
+          selector,
+          tagName: el.tagName.toLowerCase(),
+          classes: classes.length > 0 ? classes : undefined,
+          direction: cs.direction === "rtl" ? "rtl" : "ltr",
+          rect: {
+            x: Number((bcr.left - rootBcr.left).toFixed(2)),
+            y: Number((bcr.top - rootBcr.top).toFixed(2)),
+            width: Number(bcr.width.toFixed(2)),
+            height: Number(bcr.height.toFixed(2)),
+          },
+          styles,
+          text: directText || undefined,
+          renderedLines: directText ? countRenderedLines(textRects) : undefined,
+          textRects: textRects.length > 0 ? textRects : undefined,
+        });
+      }
+
+      return { nodes, rootRect, maskRects };
+    },
+    maskSelectors
+  );
+
+  // Capture screenshot cleanly via Playwright locator (scrolls below-the-fold safely & freezes animations)
   const screenshotBuffer = await locator.screenshot({
     animations: "disabled",
     caret: "hide",
@@ -195,8 +247,95 @@ export async function extractPageTelemetry(
   return {
     nodes: extraction.nodes,
     rootRect: extraction.rootRect,
+    maskRects: extraction.maskRects,
     screenshotBuffer,
   };
+}
+
+function normalizeFontList(fontFamily: string): string[] {
+  return fontFamily
+    .split(",")
+    .map((f) => f.trim().replace(/^['"]|['"]$/g, "").toLowerCase())
+    .filter(Boolean);
+}
+
+function buildRefMatchers(refNodes: NodeSpec[]) {
+  const byId = new Map<string, NodeSpec>();
+  const bySelector = new Map<string, NodeSpec>();
+  const byClassSig = new Map<string, NodeSpec[]>();
+  const byText = new Map<string, NodeSpec[]>();
+
+  for (const r of refNodes) {
+    if (r.id && r.id !== r.selector) {
+      byId.set(r.id, r);
+    }
+    bySelector.set(r.selector, r);
+
+    if (r.classes && r.classes.length > 0 && r.tagName) {
+      const sig = `${r.tagName}.${[...r.classes].sort().join(".")}`;
+      const list = byClassSig.get(sig) || [];
+      list.push(r);
+      byClassSig.set(sig, list);
+    }
+
+    if (r.text && r.text.trim().length >= 2) {
+      const normText = r.text.trim().replace(/\s+/g, " ");
+      const list = byText.get(normText) || [];
+      list.push(r);
+      byText.set(normText, list);
+    }
+  }
+
+  return { byId, bySelector, byClassSig, byText };
+}
+
+function resolveMatchedRef(
+  live: NodeSpec,
+  refMatchers: ReturnType<typeof buildRefMatchers>,
+  usedRefs: Set<NodeSpec>,
+  selectorMap?: Record<string, string>
+): NodeSpec | undefined {
+  // Tier 0: Explicit selectorMap (live selector/id -> ref id/selector)
+  if (selectorMap) {
+    const mapped = selectorMap[live.selector] || selectorMap[live.id];
+    if (mapped) {
+      const cand = refMatchers.byId.get(mapped) || refMatchers.bySelector.get(mapped);
+      if (cand && !usedRefs.has(cand)) return cand;
+    }
+  }
+
+  // Tier 1: Explicit ID or data-figma-id attribute
+  if (live.figmaId) {
+    const cand = refMatchers.byId.get(live.figmaId) || refMatchers.bySelector.get(`[data-figma-id="${live.figmaId}"]`);
+    if (cand && !usedRefs.has(cand)) return cand;
+  }
+  if (live.id && live.id !== live.selector) {
+    const cand = refMatchers.byId.get(live.id);
+    if (cand && !usedRefs.has(cand)) return cand;
+  }
+
+  // Tier 2: Exact selector path OR unique (tag + classes) signature
+  const exactSel = refMatchers.bySelector.get(live.selector);
+  if (exactSel && !usedRefs.has(exactSel)) return exactSel;
+
+  if (live.classes && live.classes.length > 0 && live.tagName) {
+    const sig = `${live.tagName}.${[...live.classes].sort().join(".")}`;
+    const cands = refMatchers.byClassSig.get(sig);
+    if (cands && cands.length === 1 && !usedRefs.has(cands[0])) {
+      return cands[0];
+    }
+  }
+
+  // Tier 3: Unique landmark / direct text match
+  if (live.text && live.text.trim().length >= 2) {
+    const normText = live.text.trim().replace(/\s+/g, " ");
+    const cands = refMatchers.byText.get(normText);
+    if (cands && cands.length === 1 && !usedRefs.has(cands[0])) {
+      return cands[0];
+    }
+  }
+
+  return undefined;
 }
 
 export function compareTelemetryWithSpec(
@@ -213,20 +352,15 @@ export function compareTelemetryWithSpec(
   const tolerance = config.geometryTolerancePx ?? 0.5;
   const colorTolerance = config.colorThresholdDeltaE ?? 2.0;
 
-  // Build lookup by selector or id
-  const refMap = new Map<string, NodeSpec>();
-  for (const n of refNodes) {
-    refMap.set(n.selector, n);
-    if (n.id && n.id !== n.selector) {
-      refMap.set(n.id, n);
-    }
-  }
+  const refMatchers = buildRefMatchers(refNodes);
+  const usedRefs = new Set<NodeSpec>();
 
   for (const live of liveNodes) {
-    const ref = refMap.get(live.selector) || (live.id ? refMap.get(live.id) : undefined);
+    const ref = resolveMatchedRef(live, refMatchers, usedRefs, config.selectorMap);
     if (!ref) continue;
+    usedRefs.add(ref);
 
-    // Check Geometry
+    // 1. Check Root-Normalized Geometry
     const dx = Number((live.rect.x - ref.rect.x).toFixed(2));
     const dy = Number((live.rect.y - ref.rect.y).toFixed(2));
     const dWidth = Number((live.rect.width - ref.rect.width).toFixed(2));
@@ -247,7 +381,7 @@ export function compareTelemetryWithSpec(
       });
     }
 
-    // Check Styles
+    // 2. Check Numeric Longhand Styles
     const styleProps: Array<keyof StyleSpec> = [
       "paddingTop",
       "paddingRight",
@@ -281,20 +415,57 @@ export function compareTelemetryWithSpec(
         const delta = Number((actVal - expVal).toFixed(2));
         const propTolerance = prop === "fontWeight" ? 50 : tolerance;
         if (Math.abs(delta) > propTolerance) {
+          const unitLabel = prop === "fontWeight" ? "" : "px";
           styleViolations.push({
             selector: live.selector,
             property: prop,
             expected: expVal,
             actual: actVal,
             delta,
-            unit: "px",
-            fixHint: `Set '${prop}' to ${expVal}px (currently ${actVal}px, drift: ${delta > 0 ? "+" : ""}${delta}px)`,
+            unit: prop === "fontWeight" ? "str" : "px",
+            fixHint: `Set '${prop}' to ${expVal}${unitLabel} (currently ${actVal}${unitLabel}, drift: ${delta > 0 ? "+" : ""}${delta}${unitLabel})`,
           });
         }
       }
     }
 
-    // Check Colors
+    // 3. Check Primary Font Family
+    if (ref.styles.fontFamily && live.styles.fontFamily) {
+      const expFonts = normalizeFontList(ref.styles.fontFamily);
+      const actFonts = normalizeFontList(live.styles.fontFamily);
+      const primaryExpected = expFonts[0];
+      if (primaryExpected && !actFonts.includes(primaryExpected)) {
+        styleViolations.push({
+          selector: live.selector,
+          property: "fontFamily",
+          expected: primaryExpected,
+          actual: live.styles.fontFamily,
+          delta: `missing '${primaryExpected}'`,
+          unit: "str",
+          fixHint: `Ensure 'font-family' includes '${primaryExpected}' (computed: ${live.styles.fontFamily})`,
+        });
+      }
+    }
+
+    // 4. Check Rendered Lines (line wrapping drift)
+    if (
+      typeof ref.renderedLines === "number" &&
+      typeof live.renderedLines === "number" &&
+      ref.renderedLines > 0 &&
+      live.renderedLines !== ref.renderedLines
+    ) {
+      styleViolations.push({
+        selector: live.selector,
+        property: "renderedLines",
+        expected: ref.renderedLines,
+        actual: live.renderedLines,
+        delta: live.renderedLines - ref.renderedLines,
+        unit: "str",
+        fixHint: `Text wrapped to ${live.renderedLines} line(s) instead of expected ${ref.renderedLines} line(s) on '${live.selector}'`,
+      });
+    }
+
+    // 5. Check Colors (CIEDE2000)
     if (ref.styles.color && live.styles.color) {
       const colorComp = compareColors(ref.styles.color, live.styles.color, colorTolerance);
       if (!colorComp.match) {

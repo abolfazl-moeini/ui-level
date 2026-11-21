@@ -12,6 +12,7 @@ export interface PixelDiffOptions {
   ignoreRegions?: Array<{ x1: number; y1: number; x2: number; y2: number }>;
   maskRects?: GeometryRect[];
   adapter?: "html" | "figma" | "image";
+  subpixelTolerancePx?: number;
 }
 
 export function transformRectsToIgnoreRegions(
@@ -51,10 +52,17 @@ export async function runPixelDiff(
     outputDir
   );
 
-  const { refDimensions, liveDimensions, unifiedDimensions, dimensionDrift } = normResult;
+  const { refDimensions, liveDimensions, unifiedDimensions } = normResult;
+  const dw = Math.abs(refDimensions.width - liveDimensions.width);
+  const dh = Math.abs(refDimensions.height - liveDimensions.height);
 
-  // 2. Prepare ignore regions
-  let finalIgnoreRegions: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+  // Plan §3.2(5): Accept physical ±1px subpixel rounding in Figma external bounds before flagging DIMENSION_DRIFT
+  const allowedSubpixel =
+    options.adapter === "figma" ? (options.subpixelTolerancePx ?? 1) : 0;
+  const dimensionDrift = normResult.dimensionDrift && (dw > allowedSubpixel || dh > allowedSubpixel);
+
+  // 2. Prepare ignore regions (CSS 1x viewport coords -> DPR cropped pixel coords)
+  const finalIgnoreRegions: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
 
   if (options.ignoreRegions && options.ignoreRegions.length > 0) {
     finalIgnoreRegions.push(...options.ignoreRegions);
@@ -96,7 +104,7 @@ export async function runPixelDiff(
   let diffPercentage = 0;
 
   if (result.match) {
-    match = !dimensionDrift; // If dimensions drifted, overall match is false even if overlapping content matches
+    match = !dimensionDrift;
     diffCount = 0;
     diffPercentage = 0;
   } else if (result.reason === "pixel-diff") {
@@ -105,7 +113,9 @@ export async function runPixelDiff(
     match = diffCount === 0 && !dimensionDrift;
   } else if (result.reason === "layout-diff") {
     match = false;
-    diffCount = Math.abs(refDimensions.width * refDimensions.height - liveDimensions.width * liveDimensions.height);
+    diffCount = Math.abs(
+      refDimensions.width * refDimensions.height - liveDimensions.width * liveDimensions.height
+    );
     diffPercentage = 100;
   } else {
     match = false;

@@ -1,13 +1,67 @@
 import { Command } from "commander";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { check } from "./index.js";
 import { resolveBrowserExecutable, launchBrowser } from "./browser/resolver.js";
-import { isDaemonRunning, sendDaemonRequest, startDaemon, getDaemonSocketPath } from "./browser/daemon.js";
+import {
+  isDaemonRunning,
+  sendDaemonRequest,
+  startDaemon,
+  stopDaemon,
+  getDaemonSocketPath,
+} from "./browser/daemon.js";
 import { startMcpServer } from "./mcp/server.js";
 import type { DeltaPacket, UILevelConfig } from "./schema.js";
 
 const program = new Command();
+
+function isRemoteOrFigmaId(val?: string): boolean {
+  if (!val) return true;
+  if (val.startsWith("http://") || val.startsWith("https://")) return true;
+  // Treat explicit fileKey:nodeId without path separators or extension as Figma shorthand
+  if (val.includes(":") && !val.includes("/") && !val.includes("\\") && !/\.[a-z0-9]+$/i.test(val)) {
+    return true;
+  }
+  return false;
+}
+
+function resolveLocalPathIfAny(val: string | undefined, baseDir: string): string | undefined {
+  if (!val) return undefined;
+  if (isRemoteOrFigmaId(val)) return val;
+  return path.resolve(baseDir, val);
+}
+
+function parseViewportFlag(val: string): { width: number; height: number } {
+  const m = val.trim().match(/^(\d+)x(\d+)$/i);
+  if (!m) {
+    throw new Error(`Invalid viewport '${val}'. Expected format '<width>x<height>', e.g. 1280x800.`);
+  }
+  return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+}
+
+async function ensureWarmDaemon(): Promise<boolean> {
+  if (await isDaemonRunning()) return true;
+
+  try {
+    const child = spawn(process.execPath, [process.argv[1], "daemon", "start", "--foreground"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (await isDaemonRunning()) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } catch {
+    // Fall back to direct execution
+  }
+  return false;
+}
 
 program
   .name("ui-level")
@@ -18,20 +72,36 @@ program
   .command("check")
   .description("Run visual & CSS regression check between target and reference")
   .option("-t, --target <url|file>", "Target URL or local HTML file")
-  .option("-r, --ref <url|file|key>", "Reference HTML, image, or Figma node")
-  .option("-a, --adapter <type>", "Adapter type: html, figma, image", "html")
-  .option("-s, --selector <css>", "CSS selector to inspect", "body")
+  .option("-r, --ref <url|file|key>", "Reference HTML, image, or Figma node/URL")
+  .option("-a, --adapter <type>", "Adapter type: html, figma, image")
+  .option("-s, --selector <css>", "CSS selector to inspect")
   .option("--threshold <number>", "Pixel diff threshold (0.0 to 1.0)", parseFloat)
+  .option("--viewport <WxH>", "Viewport size, e.g. 1280x800")
   .option("-c, --config <path>", "Path to ui-level.config.json")
   .option("--mask <selectors...>", "Selectors to mask from pixel diff")
   .option("--inject-css <css>", "Custom CSS to inject into target page")
   .option("--root <dir>", "Project root directory")
+  .option("--output <dir>", "Output directory for screenshots and triplet", undefined)
+  .option("--ref-spec <path>", "Offline reference spec JSON path (Figma MCP)")
+  .option("--ref-image <path>", "Offline reference PNG image path (Figma MCP)")
+  .option("--ignore-https-errors", "Ignore HTTPS certificate errors")
+  .option("--no-ignore-https-errors", "Enforce strict HTTPS certificates")
   .option("--daemon", "Use background daemon for sub-350ms warm execution")
   .option("--json", "Output pure JSON DeltaPacket to stdout")
-  .action(async (options) => {
+  .action(async (options, cmd) => {
     try {
       let fileConfig: Partial<UILevelConfig> = {};
-      const configPath = options.config || (fs.existsSync("ui-level.config.json") ? "ui-level.config.json" : null);
+      const defaultCandidates = [
+        "ui-level.config.json",
+        path.join(".harness", "frontend", "ui-level.config.json"),
+      ];
+      const discoveredConfig = defaultCandidates.find((p) => fs.existsSync(p)) || null;
+      const configPath = options.config || discoveredConfig;
+
+      if (options.config && !fs.existsSync(options.config)) {
+        console.error(`Config file not found: ${options.config}`);
+        process.exit(2);
+      }
 
       if (configPath && fs.existsSync(configPath)) {
         try {
@@ -43,24 +113,54 @@ program
         }
       }
 
+      const cliSet = (name: string) => cmd.getOptionValueSource(name) === "cli";
+
+      const mergedViewport = options.viewport
+        ? {
+            deviceScaleFactor: 2,
+            ...(fileConfig.viewport || {}),
+            ...parseViewportFlag(options.viewport),
+          }
+        : fileConfig.viewport;
+
       const mergedConfig: Partial<UILevelConfig> = {
         ...fileConfig,
-        targetUrl: options.target || fileConfig.targetUrl || "index.html",
-        ref: options.ref || fileConfig.ref,
-        adapter: (options.adapter as any) || fileConfig.adapter || "html",
-        selector: options.selector || fileConfig.selector || "body",
-        threshold: options.threshold !== undefined ? options.threshold : fileConfig.threshold,
-        maskSelectors: options.mask || fileConfig.maskSelectors || [],
-        injectCss: options.injectCss || fileConfig.injectCss,
-        root: options.root || fileConfig.root,
+        targetUrl: cliSet("target") ? options.target : fileConfig.targetUrl || "index.html",
+        ref: cliSet("ref") ? options.ref : fileConfig.ref,
+        adapter: cliSet("adapter") ? (options.adapter as any) : fileConfig.adapter || "html",
+        selector: cliSet("selector") ? options.selector : fileConfig.selector || "body",
+        threshold: cliSet("threshold") ? options.threshold : fileConfig.threshold,
+        maskSelectors: cliSet("mask")
+          ? [...(fileConfig.maskSelectors || []), ...(options.mask || [])]
+          : fileConfig.maskSelectors || [],
+        injectCss: cliSet("injectCss") ? options.injectCss : fileConfig.injectCss,
+        root: cliSet("root") ? options.root : fileConfig.root,
+        outputDir: cliSet("output") ? options.output : fileConfig.outputDir || ".ui-level",
+        refSpec: cliSet("refSpec") ? options.refSpec : fileConfig.refSpec,
+        refImage: cliSet("refImage") ? options.refImage : fileConfig.refImage,
+        ignoreHttpsErrors: cliSet("ignoreHttpsErrors")
+          ? options.ignoreHttpsErrors
+          : fileConfig.ignoreHttpsErrors,
+        ...(mergedViewport ? { viewport: mergedViewport } : {}),
       };
 
       let result: DeltaPacket;
 
       if (options.daemon) {
-        const daemonActive = await isDaemonRunning();
-        if (daemonActive) {
-          result = await sendDaemonRequest<DeltaPacket>(mergedConfig);
+        const cwd = process.cwd();
+        const daemonPayload: Partial<UILevelConfig> = {
+          ...mergedConfig,
+          targetUrl: resolveLocalPathIfAny(mergedConfig.targetUrl, cwd),
+          ref: resolveLocalPathIfAny(mergedConfig.ref, cwd),
+          refSpec: resolveLocalPathIfAny(mergedConfig.refSpec, cwd),
+          refImage: resolveLocalPathIfAny(mergedConfig.refImage, cwd),
+          root: mergedConfig.root ? path.resolve(cwd, mergedConfig.root) : cwd,
+          outputDir: path.resolve(cwd, mergedConfig.outputDir || ".ui-level"),
+        };
+
+        const ready = await ensureWarmDaemon();
+        if (ready) {
+          result = await sendDaemonRequest<DeltaPacket>(daemonPayload);
         } else {
           result = await check(mergedConfig);
         }
@@ -88,7 +188,6 @@ program
     console.log("\n=== ui-level System Diagnostics ===\n");
     let hasError = false;
 
-    // 1. Node version
     const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
     if (nodeMajor >= 20) {
       console.log(`[PASS] Node.js runtime: ${process.version}`);
@@ -97,7 +196,6 @@ program
       hasError = true;
     }
 
-    // 2. Browser executable
     try {
       const browserPath = resolveBrowserExecutable();
       console.log(`[PASS] Chromium executable: ${browserPath}`);
@@ -110,7 +208,6 @@ program
       hasError = true;
     }
 
-    // 3. odiff-bin
     try {
       const odiff = await import("odiff-bin");
       if (typeof odiff.compare === "function") {
@@ -124,7 +221,6 @@ program
       hasError = true;
     }
 
-    // 4. sharp
     try {
       const sharp = (await import("sharp")).default;
       const v = sharp.versions;
@@ -134,7 +230,6 @@ program
       hasError = true;
     }
 
-    // 5. colorjs.io
     try {
       const Color = (await import("colorjs.io")).default;
       const c1 = new Color("red");
@@ -182,7 +277,8 @@ program
   .command("daemon")
   .description("Manage the warm background daemon")
   .argument("[action]", "start, stop, or status", "status")
-  .action(async (action) => {
+  .option("--foreground", "Keep daemon attached to the foreground process")
+  .action(async (action, opts) => {
     const running = await isDaemonRunning();
 
     if (action === "status") {
@@ -199,23 +295,37 @@ program
         console.log(`Daemon is already running at ${getDaemonSocketPath()}`);
         process.exit(0);
       }
-      console.log("Starting background daemon...");
-      await startDaemon(async (payload, browser) => {
-        return check(payload, browser);
-      });
-      process.exit(0);
+
+      if (opts.foreground) {
+        await startDaemon(async (payload, browser) => {
+          return check(payload, browser);
+        });
+        console.log(`Daemon listening at ${getDaemonSocketPath()}`);
+        return; // Keep event loop alive until idle timeout or SIGINT/SIGTERM
+      }
+
+      const started = await ensureWarmDaemon();
+      if (started) {
+        console.log(`Daemon started at ${getDaemonSocketPath()}`);
+        process.exit(0);
+      } else {
+        console.error("Failed to start background daemon.");
+        process.exit(2);
+      }
     }
 
     if (action === "stop") {
-      const sock = getDaemonSocketPath();
-      if (fs.existsSync(sock)) {
-        fs.unlinkSync(sock);
-        console.log("Daemon socket removed.");
+      const stopped = await stopDaemon();
+      if (stopped) {
+        console.log("Daemon stopped cleanly.");
       } else {
-        console.log("No daemon socket found.");
+        console.log("No active daemon found.");
       }
       process.exit(0);
     }
+
+    console.error(`Unknown daemon action '${action}'. Use start, stop, or status.`);
+    process.exit(2);
   });
 
 program
@@ -263,10 +373,18 @@ function renderHumanReport(packet: DeltaPacket): void {
   if (packet.styleViolations.length > 0) {
     console.log(`\x1b[33mGate 1: Style Violations (${packet.styleViolations.length}):\x1b[0m`);
     for (const v of packet.styleViolations) {
+      const unitSuffix = v.unit === "px" || v.unit === "dE00" ? v.unit : "";
       console.log(`  - \x1b[1m${v.selector}\x1b[0m -> ${v.property}`);
-      console.log(`    Expected: ${v.expected}${v.unit} | Actual: ${v.actual}${v.unit} (Δ: ${v.delta})`);
+      console.log(
+        `    Expected: ${v.expected}${unitSuffix} | Actual: ${v.actual}${unitSuffix} (Δ: ${v.delta})`
+      );
       if (v.cssRuleSource?.file) {
-        console.log(`    Source:   ${v.cssRuleSource.file}:${v.cssRuleSource.line || 1}`);
+        const loc = v.cssRuleSource.line
+          ? v.cssRuleSource.column
+            ? `${v.cssRuleSource.file}:${v.cssRuleSource.line}:${v.cssRuleSource.column}`
+            : `${v.cssRuleSource.file}:${v.cssRuleSource.line}`
+          : v.cssRuleSource.file;
+        console.log(`    Source:   ${loc} (${v.cssRuleSource.selector || ""})`);
       }
       console.log(`    Fix:      \x1b[36m${v.fixHint}\x1b[0m`);
     }

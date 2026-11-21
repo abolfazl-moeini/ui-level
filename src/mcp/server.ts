@@ -1,8 +1,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Browser } from "playwright-core";
 import { check } from "../index.js";
-import { resolveBrowserExecutable } from "../browser/resolver.js";
+import { launchBrowser, resolveBrowserExecutable } from "../browser/resolver.js";
 
 export async function startMcpServer(): Promise<void> {
   const server = new Server(
@@ -16,6 +17,16 @@ export async function startMcpServer(): Promise<void> {
       },
     }
   );
+
+  let warmBrowser: Browser | undefined;
+
+  async function getBrowser(): Promise<Browser> {
+    if (warmBrowser && warmBrowser.isConnected()) {
+      return warmBrowser;
+    }
+    warmBrowser = await launchBrowser();
+    return warmBrowser;
+  }
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
@@ -33,7 +44,7 @@ export async function startMcpServer(): Promise<void> {
               },
               ref: {
                 type: "string",
-                description: "Reference HTML file, Figma fileKey/nodeId, or image path",
+                description: "Reference HTML file, Figma 'fileKey:nodeId' or URL, or image/SVG path",
               },
               adapter: {
                 type: "string",
@@ -51,10 +62,48 @@ export async function startMcpServer(): Promise<void> {
                 description: "Pixel diff threshold (0 to 1, default 0.05)",
                 default: 0.05,
               },
+              viewport: {
+                type: "object",
+                properties: {
+                  width: { type: "number" },
+                  height: { type: "number" },
+                  deviceScaleFactor: { type: "number" },
+                },
+                description: "Viewport dimensions & scale",
+              },
               maskSelectors: {
                 type: "array",
                 items: { type: "string" },
                 description: "Selectors to mask out from pixel diff",
+              },
+              selectorMap: {
+                type: "object",
+                additionalProperties: { type: "string" },
+                description: "Explicit mapping from live selectors to reference IDs/selectors",
+              },
+              injectCss: {
+                type: "string",
+                description: "Custom CSS injected before capture",
+              },
+              root: {
+                type: "string",
+                description: "Explicit project root directory for static asset resolution",
+              },
+              outputDir: {
+                type: "string",
+                description: "Directory for live/diff/triplet PNG artifacts",
+              },
+              refSpec: {
+                type: "string",
+                description: "Offline reference JSON spec path (for Figma MCP)",
+              },
+              refImage: {
+                type: "string",
+                description: "Offline reference PNG image path (for Figma MCP)",
+              },
+              ignoreHttpsErrors: {
+                type: "boolean",
+                default: true,
               },
             },
             required: ["targetUrl"],
@@ -105,7 +154,8 @@ export async function startMcpServer(): Promise<void> {
 
     if (name === "level_check") {
       try {
-        const result = await check(args as any);
+        const browser = await getBrowser();
+        const result = await check((args || {}) as any, browser);
         return {
           content: [
             {
@@ -126,5 +176,11 @@ export async function startMcpServer(): Promise<void> {
   });
 
   const transport = new StdioServerTransport();
+  transport.onclose = async () => {
+    if (warmBrowser) {
+      await warmBrowser.close().catch(() => {});
+      warmBrowser = undefined;
+    }
+  };
   await server.connect(transport);
 }

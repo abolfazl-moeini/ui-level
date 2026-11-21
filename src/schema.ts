@@ -63,11 +63,15 @@ export type StyleSpec = z.infer<typeof StyleSpecSchema>;
 
 export const NodeSpecSchema = z.object({
   id: z.string(),
+  figmaId: z.string().optional(),
   selector: z.string(),
   tagName: z.string().optional(),
+  classes: z.array(z.string()).optional(),
+  direction: z.enum(["ltr", "rtl"]).optional(),
   rect: GeometryRectSchema,
   styles: StyleSpecSchema,
   text: z.string().optional(),
+  renderedLines: z.number().int().nonnegative().optional(),
   textRects: z.array(GeometryRectSchema).optional(),
 });
 
@@ -162,11 +166,14 @@ export const ConfigSchema = z.object({
   geometryTolerancePx: z.number().nonnegative().default(0.5),
   subpixelTolerancePx: z.number().nonnegative().default(1.0),
   selector: z.string().default("body"),
+  selectorMap: z.record(z.string(), z.string()).optional(),
   maskSelectors: z.array(z.string()).default([]),
   injectCss: z.string().optional(),
   ignoreHttpsErrors: z.boolean().default(true),
   root: z.string().optional(),
   outputDir: z.string().default(".ui-level"),
+  refSpec: z.string().optional(),
+  refImage: z.string().optional(),
   figma: z
     .object({
       token: z.string().optional(),

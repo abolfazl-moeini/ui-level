@@ -31,18 +31,25 @@ export interface StaticServerInstance {
   getUrlForFile: (filePath: string) => string;
 }
 
+export function isWithinRoot(targetPath: string, rootDir: string): boolean {
+  const rel = path.relative(path.resolve(rootDir), path.resolve(targetPath));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
 export function findProjectRoot(targetPath: string, explicitRoot?: string): string {
   const absTarget = path.resolve(targetPath);
 
   if (explicitRoot) {
     const resolvedExplicit = path.resolve(explicitRoot);
-    if (absTarget.startsWith(resolvedExplicit)) {
+    if (isWithinRoot(absTarget, resolvedExplicit)) {
       return resolvedExplicit;
     }
   }
-  let currentDir = fs.existsSync(absTarget) && fs.statSync(absTarget).isDirectory()
-    ? absTarget
-    : path.dirname(absTarget);
+
+  let currentDir =
+    fs.existsSync(absTarget) && fs.statSync(absTarget).isDirectory()
+      ? absTarget
+      : path.dirname(absTarget);
 
   const rootMarkers = [".git", "package.json", "node_modules", "assets", "css"];
 
@@ -62,16 +69,17 @@ export function findProjectRoot(targetPath: string, explicitRoot?: string): stri
 
 export async function startStaticServer(rootDir: string): Promise<StaticServerInstance> {
   const resolvedRoot = path.resolve(rootDir);
+  const realRoot = fs.existsSync(resolvedRoot) ? fs.realpathSync(resolvedRoot) : resolvedRoot;
 
   const server = http.createServer((req, res) => {
     try {
       const rawUrl = req.url || "/";
       const parsedPath = decodeURIComponent(new URL(rawUrl, "http://127.0.0.1").pathname);
-      const safeRelativePath = path.normalize(parsedPath).replace(/^(\.\.[/\\])+/, "");
-      const fullPath = path.join(resolvedRoot, safeRelativePath);
+      const relUrlPath = parsedPath.replace(/^\/+/, "");
+      const fullPath = path.resolve(resolvedRoot, relUrlPath);
 
-      // Path traversal security check
-      if (!fullPath.startsWith(resolvedRoot)) {
+      // Strict path containment check (no prefix bypass)
+      if (!isWithinRoot(fullPath, resolvedRoot)) {
         res.writeHead(403, { "Content-Type": "text/plain" });
         res.end("403 Forbidden");
         return;
@@ -91,10 +99,18 @@ export async function startStaticServer(rootDir: string): Promise<StaticServerIn
         return;
       }
 
-      const ext = path.extname(filePathToServe).toLowerCase();
+      // Guard against symlinks escaping rootDir
+      const realFile = fs.realpathSync(filePathToServe);
+      if (!isWithinRoot(realFile, realRoot)) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("403 Forbidden");
+        return;
+      }
+
+      const ext = path.extname(realFile).toLowerCase();
       const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
-      const stream = fs.createReadStream(filePathToServe);
+      const stream = fs.createReadStream(realFile);
       res.writeHead(200, {
         "Content-Type": contentType,
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -130,6 +146,9 @@ export async function startStaticServer(rootDir: string): Promise<StaticServerIn
     getUrlForFile: (filePath: string) => {
       const abs = path.resolve(filePath);
       const rel = path.relative(resolvedRoot, abs);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        throw new Error(`File '${filePath}' is outside static root '${resolvedRoot}'`);
+      }
       const normalizedRel = rel.split(path.sep).join("/");
       return `${baseUrl}/${normalizedRel}`;
     },

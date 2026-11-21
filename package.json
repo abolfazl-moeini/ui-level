@@ -25,7 +25,7 @@
     "Dockerfile"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "doctor": "node ./dist/cli.js doctor",

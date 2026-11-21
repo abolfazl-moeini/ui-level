@@ -1,26 +1,37 @@
 import path from "node:path";
 import fs from "node:fs";
-import type { Browser } from "playwright-core";
+import type { Browser, BrowserContext } from "playwright-core";
 import {
   ConfigSchema,
   DeltaPacketSchema,
   type DeltaPacket,
   type GeometryRect,
+  type NormalizedSpec,
   type UILevelConfig,
 } from "./schema.js";
 import { launchBrowser } from "./browser/resolver.js";
 import { extractPageTelemetry, compareTelemetryWithSpec } from "./browser/telemetry.js";
-import { findWinningCssRule } from "./browser/cdp-styles.js";
+import { createCdpStyleInspector, type CdpStyleInspector } from "./browser/cdp-styles.js";
 import { runPixelDiff } from "./diff/pixel.js";
 import { generateTripletImage } from "./diff/triplet.js";
 import { processHTMLReference } from "./adapters/html.adapter.js";
 import { processImageReference } from "./adapters/image.adapter.js";
 import { processFigmaReference } from "./adapters/figma.adapter.js";
-import { findProjectRoot, startStaticServer, type StaticServerInstance } from "./server/static-host.js";
+import {
+  findProjectRoot,
+  startStaticServer,
+  type StaticServerInstance,
+} from "./server/static-host.js";
 
 export * from "./schema.js";
-export { launchBrowser } from "./browser/resolver.js";
-export { startDaemon, isDaemonRunning, sendDaemonRequest } from "./browser/daemon.js";
+export { launchBrowser, resolveBrowserExecutable } from "./browser/resolver.js";
+export {
+  startDaemon,
+  stopDaemon,
+  isDaemonRunning,
+  sendDaemonRequest,
+  getDaemonSocketPath,
+} from "./browser/daemon.js";
 export { startStaticServer } from "./server/static-host.js";
 
 export async function check(
@@ -45,33 +56,38 @@ export async function check(
   }
 
   let targetServer: StaticServerInstance | undefined;
+  let targetContext: BrowserContext | undefined;
+  let cdpInspector: CdpStyleInspector | undefined;
   let targetUrl = config.targetUrl;
 
   try {
     // 1. Resolve local target files via static server from project root
-    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+    const isRemoteTarget = targetUrl.startsWith("http://") || targetUrl.startsWith("https://");
+    if (!isRemoteTarget) {
+      if (!fs.existsSync(path.resolve(targetUrl))) {
+        throw new Error(`Target HTML/SVG file not found: ${targetUrl}`);
+      }
       const projectRoot = findProjectRoot(targetUrl, config.root);
       targetServer = await startStaticServer(projectRoot);
       targetUrl = targetServer.getUrlForFile(targetUrl);
     }
 
     // 2. Process Reference via Adapter
-    let refResult: { spec: any; refScreenshotPath: string; closeServer?: () => Promise<void> };
+    let refResult: { spec: NormalizedSpec; refScreenshotPath: string };
 
     if (config.adapter === "figma") {
-      refResult = await processFigmaReference(config, outputDir, {
-        refSpecPath: config.ref?.endsWith(".json") ? config.ref : undefined,
-        refImagePath: config.ref?.endsWith(".png") ? config.ref : undefined,
-      });
-    } else if (config.adapter === "image" || (config.ref && /\.(png|jpe?g|svg|webp)$/i.test(config.ref))) {
+      refResult = await processFigmaReference(config, outputDir);
+    } else if (
+      config.adapter === "image" ||
+      (config.ref && /\.(png|jpe?g|svg|webp)$/i.test(config.ref))
+    ) {
       refResult = await processImageReference(browser, config.ref || "ref.png", config, outputDir);
     } else {
-      // Default HTML adapter
       refResult = await processHTMLReference(browser, config.ref || "ref.html", config, outputDir);
     }
 
-    // 3. Navigate to Live Target Page
-    const context = await browser.newContext({
+    // 3. Navigate to Live Target Page in an isolated BrowserContext
+    targetContext = await browser.newContext({
       viewport: {
         width: config.viewport.width,
         height: config.viewport.height,
@@ -80,15 +96,20 @@ export async function check(
       ignoreHTTPSErrors: config.ignoreHttpsErrors,
     });
 
-    const page = await context.newPage();
+    const page = await targetContext.newPage();
     await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 30000 });
 
     if (config.injectCss) {
       await page.addStyleTag({ content: config.injectCss });
     }
 
-    // 4. Extract Live Page Telemetry & Live Screenshot
-    const liveTelemetry = await extractPageTelemetry(page, config.selector, liveScreenshotPath);
+    // 4. Extract Live Page Telemetry, Mask Rects & Live Screenshot
+    const liveTelemetry = await extractPageTelemetry(
+      page,
+      config.selector,
+      liveScreenshotPath,
+      config.maskSelectors
+    );
 
     // 5. Gate 1: Deterministic Style & Geometry Check
     const { styleViolations, geometryViolations } = compareTelemetryWithSpec(
@@ -97,33 +118,28 @@ export async function check(
       config
     );
 
-    // Lazy CDP Inspection for winning CSS rule on style violations
+    // Lazy CDP Inspection: zero overhead on green runs, single shared session on violations
     if (styleViolations.length > 0) {
+      cdpInspector = await createCdpStyleInspector(page);
       for (const violation of styleViolations) {
-        const source = await findWinningCssRule(page, violation.selector, violation.property);
+        if (violation.property === "renderedLines") continue;
+        const source = await cdpInspector.inspect(violation.selector, violation.property);
         if (source) {
           violation.cssRuleSource = source;
         }
       }
+      await cdpInspector.dispose();
+      cdpInspector = undefined;
     }
+
+    await targetContext.close();
+    targetContext = undefined;
 
     // 6. Gate 2: Pixel Diff
-    const maskRects: GeometryRect[] = [];
+    const maskRects: GeometryRect[] = [...liveTelemetry.maskRects];
 
-    // Collect user mask selectors
-    if (config.maskSelectors && config.maskSelectors.length > 0) {
-      for (const maskSel of config.maskSelectors) {
-        const count = await page.locator(maskSel).count();
-        for (let i = 0; i < count; i++) {
-          const bcr = await page.locator(maskSel).nth(i).boundingBox();
-          if (bcr) {
-            maskRects.push(bcr);
-          }
-        }
-      }
-    }
-
-    // If Figma adapter, add text regions to maskRects so Skia vs CoreText text antialiasing does not give false diffs
+    // Plan §3.2(2): In Figma mode, typography is proven 100% in Gate 1; keep text rects masked
+    // during Gate 2 to eliminate Skia vs CoreText/FreeType font shaping false positives.
     if (config.adapter === "figma") {
       for (const node of liveTelemetry.nodes) {
         if (node.textRects && node.textRects.length > 0) {
@@ -142,10 +158,10 @@ export async function check(
         cropRect: liveTelemetry.rootRect,
         maskRects,
         adapter: config.adapter,
+        subpixelTolerancePx: config.subpixelTolerancePx,
       }
     );
 
-    // Generate Triplet image (Ref | Live | Diff)
     await generateTripletImage(
       refResult.refScreenshotPath,
       liveScreenshotPath,
@@ -153,11 +169,6 @@ export async function check(
       tripletOutputPath
     );
     pixelDiff.tripletImagePath = tripletOutputPath;
-
-    await context.close();
-    if (refResult.closeServer) {
-      await refResult.closeServer();
-    }
 
     const durationMs = Date.now() - startTime;
     const isPass =
@@ -190,7 +201,7 @@ export async function check(
       timestamp: new Date().toISOString(),
       durationMs,
       targetUrl: config.targetUrl,
-      refSource: config.ref || "default",
+      refSource: config.ref || config.refSpec || "default",
       styleViolations,
       geometryViolations,
       pixelDiff,
@@ -199,6 +210,12 @@ export async function check(
 
     return DeltaPacketSchema.parse(deltaPacket);
   } finally {
+    if (cdpInspector) {
+      await cdpInspector.dispose();
+    }
+    if (targetContext) {
+      await targetContext.close();
+    }
     if (targetServer) {
       await targetServer.close();
     }

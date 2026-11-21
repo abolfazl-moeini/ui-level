@@ -3,12 +3,15 @@ import fs from "node:fs";
 import type { Browser } from "playwright-core";
 import type { NormalizedSpec, UILevelConfig } from "../schema.js";
 import { extractPageTelemetry } from "../browser/telemetry.js";
-import { findProjectRoot, startStaticServer, type StaticServerInstance } from "../server/static-host.js";
+import {
+  findProjectRoot,
+  startStaticServer,
+  type StaticServerInstance,
+} from "../server/static-host.js";
 
 export interface HTMLAdapterResult {
   spec: NormalizedSpec;
   refScreenshotPath: string;
-  closeServer?: () => Promise<void>;
 }
 
 export async function processHTMLReference(
@@ -23,11 +26,7 @@ export async function processHTMLReference(
   let server: StaticServerInstance | undefined;
   let targetUrl = refTarget;
 
-  if (!refTarget.startsWith("http://") && !refTarget.startsWith("https://")) {
-    const projectRoot = findProjectRoot(refTarget, config.root);
-    server = await startStaticServer(projectRoot);
-    targetUrl = server.getUrlForFile(refTarget);
-  }
+  const isRemote = refTarget.startsWith("http://") || refTarget.startsWith("https://");
 
   const context = await browser.newContext({
     viewport: {
@@ -38,9 +37,17 @@ export async function processHTMLReference(
     ignoreHTTPSErrors: config.ignoreHttpsErrors,
   });
 
-  const page = await context.newPage();
-
   try {
+    if (!isRemote) {
+      if (!fs.existsSync(path.resolve(refTarget))) {
+        throw new Error(`Reference HTML file not found: ${refTarget}`);
+      }
+      const projectRoot = findProjectRoot(refTarget, config.root);
+      server = await startStaticServer(projectRoot);
+      targetUrl = server.getUrlForFile(refTarget);
+    }
+
+    const page = await context.newPage();
     await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 30000 });
 
     if (config.injectCss) {
@@ -59,9 +66,11 @@ export async function processHTMLReference(
     return {
       spec,
       refScreenshotPath,
-      closeServer: server ? server.close : undefined,
     };
   } finally {
     await context.close();
+    if (server) {
+      await server.close();
+    }
   }
 }

@@ -3,12 +3,15 @@ import fs from "node:fs";
 import type { Browser } from "playwright-core";
 import sharp from "sharp";
 import type { NormalizedSpec, UILevelConfig } from "../schema.js";
-import { findProjectRoot, startStaticServer, type StaticServerInstance } from "../server/static-host.js";
+import {
+  findProjectRoot,
+  startStaticServer,
+  type StaticServerInstance,
+} from "../server/static-host.js";
 
 export interface ImageAdapterResult {
   spec: NormalizedSpec;
   refScreenshotPath: string;
-  closeServer?: () => Promise<void>;
 }
 
 export async function processImageReference(
@@ -20,18 +23,13 @@ export async function processImageReference(
   fs.mkdirSync(outputDir, { recursive: true });
   const refScreenshotPath = path.join(outputDir, "ref.png");
 
-  const ext = path.extname(refTarget).toLowerCase();
+  const isRemoteUrl = refTarget.startsWith("http://") || refTarget.startsWith("https://");
+  const cleanUrlPath = isRemoteUrl ? new URL(refTarget).pathname : refTarget;
+  const ext = path.extname(cleanUrlPath).toLowerCase();
 
   if (ext === ".svg") {
-    // Render SVG inside Chromium for 100% font fidelity and RTL ligature preservation
     let server: StaticServerInstance | undefined;
     let svgUrl = refTarget;
-
-    if (!refTarget.startsWith("http://") && !refTarget.startsWith("https://")) {
-      const projectRoot = findProjectRoot(refTarget, config.root);
-      server = await startStaticServer(projectRoot);
-      svgUrl = server.getUrlForFile(refTarget);
-    }
 
     const context = await browser.newContext({
       viewport: {
@@ -39,13 +37,22 @@ export async function processImageReference(
         height: config.viewport.height,
       },
       deviceScaleFactor: config.viewport.deviceScaleFactor,
+      ignoreHTTPSErrors: config.ignoreHttpsErrors,
     });
 
-    const page = await context.newPage();
-
     try {
+      if (!isRemoteUrl) {
+        if (!fs.existsSync(path.resolve(refTarget))) {
+          throw new Error(`Reference SVG file not found: ${refTarget}`);
+        }
+        const projectRoot = findProjectRoot(refTarget, config.root);
+        server = await startStaticServer(projectRoot);
+        svgUrl = server.getUrlForFile(refTarget);
+      }
+
+      const page = await context.newPage();
       await page.goto(svgUrl, { waitUntil: "networkidle", timeout: 15000 });
-      // Capture screenshot of the SVG element
+
       const svgLocator = page.locator("svg").first();
       const hasSvgTag = (await svgLocator.count()) > 0;
 
@@ -62,28 +69,31 @@ export async function processImageReference(
           path: refScreenshotPath,
         });
       }
-
+    } finally {
+      await context.close();
       if (server) {
         await server.close();
       }
-    } finally {
-      await context.close();
     }
+  } else if (isRemoteUrl) {
+    const res = await fetch(refTarget);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch reference image ${refTarget}: HTTP ${res.status}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    await sharp(buf).png().toFile(refScreenshotPath);
   } else {
-    // PNG, JPEG, WEBP
     const absPath = path.resolve(refTarget);
     if (!fs.existsSync(absPath)) {
       throw new Error(`Reference image not found: ${refTarget}`);
     }
-
-    // Convert or save directly to ref.png
     await sharp(absPath).png().toFile(refScreenshotPath);
   }
 
   const meta = await sharp(refScreenshotPath).metadata();
   const dpr = config.viewport.deviceScaleFactor || 2;
-  const cssWidth = (meta.width || 0) / dpr;
-  const cssHeight = (meta.height || 0) / dpr;
+  const cssWidth = Number(((meta.width || 0) / dpr).toFixed(2));
+  const cssHeight = Number(((meta.height || 0) / dpr).toFixed(2));
 
   const spec: NormalizedSpec = {
     adapter: "image",

@@ -9,7 +9,9 @@ const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 export function getDaemonDirectory(): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
-  return path.join(os.tmpdir(), `ui-level-${uid}`);
+  // Use fixed short /tmp path on POSIX to avoid macOS $TMPDIR 104-byte sun_path truncation
+  const baseTmp = os.platform() === "win32" ? os.tmpdir() : "/tmp";
+  return path.join(baseTmp, `ui-level-${uid}`);
 }
 
 export function getDaemonSocketPath(): string {
@@ -31,14 +33,56 @@ export async function isDaemonRunning(): Promise<boolean> {
         timeout: 1000,
       },
       (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      }
+    );
+
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+
+    req.on("error", () => {
+      try {
+        if (fs.existsSync(socketPath)) {
+          fs.unlinkSync(socketPath);
+        }
+      } catch {
+        // Ignore
+      }
+      resolve(false);
+    });
+
+    req.end();
+  });
+}
+
+export async function stopDaemon(): Promise<boolean> {
+  const socketPath = getDaemonSocketPath();
+  if (!fs.existsSync(socketPath)) {
+    return false;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    const req = http.request(
+      {
+        socketPath,
+        path: "/shutdown",
+        method: "POST",
+        timeout: 2000,
+      },
+      (res) => {
+        res.resume();
         resolve(res.statusCode === 200);
       }
     );
 
     req.on("error", () => {
-      // Stale socket file
       try {
-        fs.unlinkSync(socketPath);
+        if (fs.existsSync(socketPath)) {
+          fs.unlinkSync(socketPath);
+        }
       } catch {
         // Ignore
       }
@@ -111,29 +155,50 @@ export async function startDaemon(
 
   const browser = await launchBrowser();
   let idleTimer: NodeJS.Timeout | null = null;
+  let server: http.Server;
 
-  function resetIdleTimer(server: http.Server) {
+  const cleanup = async () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(async () => {
-      try {
-        server.close();
-        await browser.close();
-        if (fs.existsSync(socketPath)) {
-          fs.unlinkSync(socketPath);
-        }
-      } catch {
-        // Ignore
+    try {
+      server?.close();
+    } catch {
+      // Ignore
+    }
+    try {
+      await browser.close();
+    } catch {
+      // Ignore
+    }
+    try {
+      if (fs.existsSync(socketPath)) {
+        fs.unlinkSync(socketPath);
       }
-      process.exit(0);
+    } catch {
+      // Ignore
+    }
+    process.exit(0);
+  };
+
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      void cleanup();
     }, idleTimeoutMs);
   }
 
-  const server = http.createServer(async (req, res) => {
-    resetIdleTimer(server);
+  server = http.createServer(async (req, res) => {
+    resetIdleTimer();
 
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      res.end(JSON.stringify({ status: "ok", pid: process.pid }));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/shutdown") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "stopping" }));
+      setImmediate(() => void cleanup());
       return;
     }
 
@@ -170,21 +235,8 @@ export async function startDaemon(
     server.on("error", reject);
   });
 
-  resetIdleTimer(server);
+  resetIdleTimer();
 
-  const cleanup = async () => {
-    try {
-      server.close();
-      await browser.close();
-      if (fs.existsSync(socketPath)) {
-        fs.unlinkSync(socketPath);
-      }
-    } catch {
-      // Ignore
-    }
-    process.exit(0);
-  };
-
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", () => void cleanup());
+  process.on("SIGTERM", () => void cleanup());
 }
