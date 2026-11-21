@@ -32,11 +32,14 @@ export interface StaticServerInstance {
 }
 
 export function findProjectRoot(targetPath: string, explicitRoot?: string): string {
-  if (explicitRoot) {
-    return path.resolve(explicitRoot);
-  }
-
   const absTarget = path.resolve(targetPath);
+
+  if (explicitRoot) {
+    const resolvedExplicit = path.resolve(explicitRoot);
+    if (absTarget.startsWith(resolvedExplicit)) {
+      return resolvedExplicit;
+    }
+  }
   let currentDir = fs.existsSync(absTarget) && fs.statSync(absTarget).isDirectory()
     ? absTarget
     : path.dirname(absTarget);
