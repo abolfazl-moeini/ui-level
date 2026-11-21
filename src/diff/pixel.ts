@@ -45,6 +45,11 @@ export async function runPixelDiff(
   const outputDir = path.dirname(diffOutputPath);
   fs.mkdirSync(outputDir, { recursive: true });
 
+  // Clean stale diff/padding artifacts from prior runs so a passing run never composites an old diff.png
+  fs.rmSync(diffOutputPath, { force: true });
+  fs.rmSync(path.join(outputDir, "ref_padded.png"), { force: true });
+  fs.rmSync(path.join(outputDir, "live_padded.png"), { force: true });
+
   // 1. Normalize dimensions (Sentinel padding on DIMENSION_DRIFT)
   const normResult = await normalizeImageDimensions(
     refImagePath,
@@ -128,6 +133,6 @@ export async function runPixelDiff(
     dimensionDrift,
     refDimensions,
     liveDimensions,
-    diffImagePath: diffOutputPath,
+    diffImagePath: fs.existsSync(diffOutputPath) ? diffOutputPath : undefined,
   };
 }

@@ -75,12 +75,18 @@ export async function check(
     // 2. Process Reference via Adapter
     let refResult: { spec: NormalizedSpec; refScreenshotPath: string };
 
-    if (config.adapter === "figma") {
+    const cleanRefPath = config.ref ? config.ref.split(/[?#]/)[0] : "";
+    const isImageRef = Boolean(cleanRefPath && /\.(png|jpe?g|svg|webp)$/i.test(cleanRefPath));
+    const effectiveAdapter: "html" | "figma" | "image" =
+      config.adapter === "figma"
+        ? "figma"
+        : config.adapter === "image" || isImageRef
+          ? "image"
+          : "html";
+
+    if (effectiveAdapter === "figma") {
       refResult = await processFigmaReference(config, outputDir);
-    } else if (
-      config.adapter === "image" ||
-      (config.ref && /\.(png|jpe?g|svg|webp)$/i.test(config.ref))
-    ) {
+    } else if (effectiveAdapter === "image") {
       refResult = await processImageReference(browser, config.ref || "ref.png", config, outputDir);
     } else {
       refResult = await processHTMLReference(browser, config.ref || "ref.html", config, outputDir);
@@ -122,7 +128,7 @@ export async function check(
     if (styleViolations.length > 0) {
       cdpInspector = await createCdpStyleInspector(page);
       for (const violation of styleViolations) {
-        if (violation.property === "renderedLines") continue;
+        if (violation.property === "renderedLines" || violation.property === "textContent") continue;
         const source = await cdpInspector.inspect(violation.selector, violation.property);
         if (source) {
           violation.cssRuleSource = source;
@@ -140,7 +146,7 @@ export async function check(
 
     // Plan §3.2(2): In Figma mode, typography is proven 100% in Gate 1; keep text rects masked
     // during Gate 2 to eliminate Skia vs CoreText/FreeType font shaping false positives.
-    if (config.adapter === "figma") {
+    if (effectiveAdapter === "figma") {
       for (const node of liveTelemetry.nodes) {
         if (node.textRects && node.textRects.length > 0) {
           maskRects.push(...node.textRects);
@@ -157,7 +163,7 @@ export async function check(
         dpr: config.viewport.deviceScaleFactor,
         cropRect: liveTelemetry.rootRect,
         maskRects,
-        adapter: config.adapter,
+        adapter: effectiveAdapter,
         subpixelTolerancePx: config.subpixelTolerancePx,
       }
     );
@@ -197,7 +203,7 @@ export async function check(
 
     const deltaPacket: DeltaPacket = {
       status: isPass ? "pass" : "fail",
-      adapter: config.adapter,
+      adapter: effectiveAdapter,
       timestamp: new Date().toISOString(),
       durationMs,
       targetUrl: config.targetUrl,

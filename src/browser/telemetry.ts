@@ -465,6 +465,23 @@ export function compareTelemetryWithSpec(
       });
     }
 
+    // 4b. Check Text Content Drift (critical for Figma mode where text pixels are masked)
+    if (ref.text && live.text) {
+      const expText = ref.text.trim().replace(/\s+/g, " ");
+      const actText = live.text.trim().replace(/\s+/g, " ");
+      if (expText !== actText) {
+        styleViolations.push({
+          selector: live.selector,
+          property: "textContent",
+          expected: expText,
+          actual: actText,
+          delta: "text mismatch",
+          unit: "str",
+          fixHint: `Update text content on '${live.selector}' to '${expText}'`,
+        });
+      }
+    }
+
     // 5. Check Colors (CIEDE2000)
     if (ref.styles.color && live.styles.color) {
       const colorComp = compareColors(ref.styles.color, live.styles.color, colorTolerance);

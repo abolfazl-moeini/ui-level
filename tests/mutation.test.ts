@@ -224,4 +224,54 @@ describe("ui-level deterministic regression engine", () => {
     expect(tripMeta.width).toBe(140 * 3 + 16 * 2);
     expect(tripMeta.height).toBe(120);
   });
+
+  it("purges stale diff.png on subsequent passing run and reports effectiveAdapter accurately", async () => {
+    const sharedDir = path.join(outputDir, "stale-diff-purge");
+
+    // Run 1: Failing run creates diff.png
+    const failRun = await check(
+      {
+        targetUrl: mutatedColorHtml,
+        ref: baseHtml,
+        adapter: "html",
+        selector: "#test-card",
+        outputDir: sharedDir,
+        root: fixturesDir,
+      },
+      browser
+    );
+    expect(failRun.status).toBe("fail");
+    expect(failRun.pixelDiff.diffImagePath).toBeDefined();
+    expect(fs.existsSync(failRun.pixelDiff.diffImagePath!)).toBe(true);
+
+    // Run 2: Passing run reusing the exact same outputDir must remove stale diff.png
+    const passRun = await check(
+      {
+        targetUrl: baseHtml,
+        ref: baseHtml,
+        adapter: "html",
+        selector: "#test-card",
+        outputDir: sharedDir,
+        root: fixturesDir,
+      },
+      browser
+    );
+    expect(passRun.status).toBe("pass");
+    expect(passRun.pixelDiff.diffImagePath).toBeUndefined();
+    expect(fs.existsSync(path.join(sharedDir, "diff.png"))).toBe(false);
+
+    // Auto-detected SVG reference without explicit adapter must report adapter: "image"
+    const autoImg = await check(
+      {
+        targetUrl: sampleSvg,
+        ref: sampleSvg,
+        selector: "svg",
+        outputDir: path.join(outputDir, "auto-adapter-svg"),
+        root: fixturesDir,
+      },
+      browser
+    );
+    expect(autoImg.status).toBe("pass");
+    expect(autoImg.adapter).toBe("image");
+  });
 });

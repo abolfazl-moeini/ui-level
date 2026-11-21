@@ -249,7 +249,9 @@ export async function processFigmaReference(
         throw new Error(`Figma offline reference image not found: ${refImagePath}`);
       }
       fs.copyFileSync(refImagePath, refScreenshotPath);
-    } else if (!fs.existsSync(refScreenshotPath)) {
+    } else if (spec.imagePath && fs.existsSync(spec.imagePath) && path.resolve(spec.imagePath) !== path.resolve(refScreenshotPath)) {
+      fs.copyFileSync(spec.imagePath, refScreenshotPath);
+    } else {
       throw new Error(
         "Figma offline spec mode requires an associated reference PNG via --ref-image or config.refImage."
       );
@@ -299,7 +301,9 @@ export async function processFigmaReference(
     throw new Error(`Figma API error (${nodeRes.status}): ${await nodeRes.text()}`);
   }
   const nodeData: any = await nodeRes.json();
-  const rootNode = nodeData.nodes?.[nodeId]?.document;
+  const rootNode =
+    nodeData.nodes?.[nodeId]?.document ||
+    (Object.values(nodeData.nodes || {})[0] as any)?.document;
   if (!rootNode) {
     throw new Error(`Node '${nodeId}' not found in Figma file '${fileKey}'`);
   }
