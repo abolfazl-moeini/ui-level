@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/abolfazl-moeini/ui-level.git"
+    "url": "git+https://github.com/abolfazl-moeini/ui-level.git"
   },
   "homepage": "https://github.com/abolfazl-moeini/ui-level#readme",
   "bugs": {
@@ -27,7 +27,7 @@
   },
   "type": "module",
   "bin": {
-    "ui-level": "./dist/cli.js"
+    "ui-level": "dist/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
