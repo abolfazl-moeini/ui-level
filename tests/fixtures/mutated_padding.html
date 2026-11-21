@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>Mutated Padding Fixture</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background-color: #f7f9fa;
+      font-family: sans-serif;
+    }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #e1e4e8;
+      border-radius: 8px;
+      padding: 18px; /* MUTATION: +2px padding */
+      width: 320px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .card-title {
+      font-size: 18px;
+      line-height: 24px;
+      font-weight: 700;
+      color: #111827;
+      margin: 0 0 8px 0;
+    }
+    .card-body {
+      font-size: 14px;
+      line-height: 20px;
+      font-weight: 400;
+      color: #4b5563;
+      margin: 0;
+    }
+    .btn {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 8px 16px;
+      background-color: #2563eb;
+      color: #ffffff;
+      border-radius: 4px;
+      font-size: 14px;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card" id="test-card">
+    <h2 class="card-title" id="card-title">تست عنوان کارت</h2>
+    <p class="card-body" id="card-desc">این یک متن آزمایشی راست‌چین برای اعتبارسنجی است.</p>
+    <a href="#" class="btn" id="card-btn">ادامه مطلب</a>
+  </div>
+</body>
+</html>
