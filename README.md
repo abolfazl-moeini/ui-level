@@ -81,6 +81,46 @@ npx ui-level check \
   --selector "#navbar"
 ```
 
+### 4. Implementation vs Figwright Reference Snapshot (`awdr74100/figwright`)
+Figwright is an open-source, bidirectional Figma MCP server that operates locally over WebSocket without requiring a paid Dev Mode seat. `ui-level` bridges with Figwright via clean, zero-dependency schema normalization and immutable reference snapshots:
+
+#### Ad-hoc Verification:
+Pass Figwright's `get_design_context` JSON directly as `--ref-spec`:
+```bash
+npx ui-level check \
+  --target http://localhost:3000 \
+  --adapter figma \
+  --ref-spec figwright-context.json \
+  --ref-image frame.png \
+  --selector "#navbar"
+```
+
+#### Immutable Snapshot Workflow:
+Freeze verified reference designs under `.ui-level/references/<slug>/` with SHA-256 integrity verification:
+```bash
+# 1. Import and freeze reference artifacts (use --force to overwrite)
+npx ui-level snapshot import \
+  --slug navbar \
+  --spec figwright-context.json \
+  --image frame.png \
+  --selector-map '{"100:1":"#navbar"}' \
+  --force
+
+# 2. Check live implementation against snapshot directory (auto-detects figma adapter & DPR)
+npx ui-level check \
+  --target http://localhost:3000 \
+  --ref .ui-level/references/navbar \
+  --selector "#navbar"
+
+# 3. Verify snapshot integrity (or bypass with --skip-integrity if intentionally editing)
+npx ui-level snapshot verify .ui-level/references/navbar
+```
+
+- **Node Correlation**: Supports both `data-figma-id` and `data-figma-node-id` in the DOM, or bidirectional `selectorMap` (`{ "100:1": "#navbar" }` or `{ "#navbar": "100:1" }`).
+- **Scale & DPR Detection**: Auto-detects `1x`/`2x`/`3x` PNG exports from Figwright's `save_screenshots` without false dimension drift (can be overridden explicitly via `--dpr <1|2|3>`).
+- **Typography Normalization**: Figwright `AUTO` units map to `node.style.lineHeightPx` with a `fontSize * 1.2` fallback for line-height (matching standard browser normal line-height) and `0px` for letter-spacing.
+- **Integrity & Immutability**: Reference bundles compute SHA-256 digests in `manifest.json`. Overwrites require `--force`, and tampering is detected at runtime unless `--skip-integrity` is passed.
+
 ---
 
 ## Warm Daemon Mode
@@ -127,7 +167,7 @@ npx ui-level init
 
 ## MCP Server (Model Context Protocol)
 
-Expose `level_check` and `level_doctor` over `stdio` for Claude Code, Cursor, or Antigravity:
+Expose `level_check`, `level_import_snapshot`, and `level_doctor` over `stdio` for Claude Code, Cursor, or Antigravity:
 
 ```json
 {
@@ -139,6 +179,8 @@ Expose `level_check` and `level_doctor` over `stdio` for Claude Code, Cursor, or
   }
 }
 ```
+
+> **Security Note:** In `level_import_snapshot`, the `baseDir` option is strictly constrained to the project root (`process.cwd()`) to prevent filesystem traversal outside the workspace.
 
 ---
 

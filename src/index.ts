@@ -5,10 +5,13 @@ import type { Browser, BrowserContext } from "playwright-core";
 import {
   ConfigSchema,
   DeltaPacketSchema,
+  NormalizedSpecSchema,
   type DeltaPacket,
   type GeometryRect,
   type NormalizedSpec,
+  type ReferenceManifest,
   type UILevelConfig,
+  type UserUILevelConfig,
 } from "./schema.js";
 import { launchBrowser } from "./browser/resolver.js";
 import { extractPageTelemetry, compareTelemetryWithSpec } from "./browser/telemetry.js";
@@ -18,6 +21,7 @@ import { generateTripletImage } from "./diff/triplet.js";
 import { processHTMLReference } from "./adapters/html.adapter.js";
 import { processImageReference } from "./adapters/image.adapter.js";
 import { processFigmaReference } from "./adapters/figma.adapter.js";
+import { isSnapshotDirectory } from "./snapshot/manager.js";
 import {
   findProjectRoot,
   startStaticServer,
@@ -25,6 +29,8 @@ import {
 } from "./server/static-host.js";
 
 export * from "./schema.js";
+export * from "./adapters/figwright.converter.js";
+export * from "./snapshot/manager.js";
 export { launchBrowser, resolveBrowserExecutable } from "./browser/resolver.js";
 export {
   startDaemon,
@@ -36,7 +42,7 @@ export {
 export { startStaticServer } from "./server/static-host.js";
 
 export async function check(
-  userConfig: Partial<UILevelConfig> = {},
+  userConfig: UserUILevelConfig = {},
   existingBrowser?: Browser
 ): Promise<DeltaPacket> {
   const startTime = Date.now();
@@ -63,7 +69,10 @@ export async function check(
 
   try {
     // 1. Resolve local target files via static server from project root
-    const isRemoteTarget = targetUrl.startsWith("http://") || targetUrl.startsWith("https://");
+    const isRemoteTarget =
+      targetUrl.startsWith("http://") ||
+      targetUrl.startsWith("https://") ||
+      targetUrl.startsWith("data:");
     if (!isRemoteTarget) {
       if (!fs.existsSync(path.resolve(targetUrl))) {
         throw new Error(`Target HTML/SVG file not found: ${targetUrl}`);
@@ -74,12 +83,24 @@ export async function check(
     }
 
     // 2. Process Reference via Adapter
-    let refResult: { spec: NormalizedSpec; refScreenshotPath: string };
+    let refResult: {
+      spec: NormalizedSpec;
+      refScreenshotPath: string;
+      warnings?: string[];
+      manifest?: ReferenceManifest;
+      inferredDpr?: number;
+    };
 
     const cleanRefPath = config.ref ? config.ref.split(/[?#]/)[0] : "";
     const isImageRef = Boolean(cleanRefPath && /\.(png|jpe?g|svg|webp)$/i.test(cleanRefPath));
+    const isSnapshotDir = Boolean(
+      (config.ref && isSnapshotDirectory(config.ref)) ||
+      (config.refSpec && isSnapshotDirectory(config.refSpec))
+    );
+    const hasExplicitNonFigmaAdapter =
+      userConfig.adapter === "html" || userConfig.adapter === "image";
     const effectiveAdapter: "html" | "figma" | "image" =
-      config.adapter === "figma"
+      config.adapter === "figma" || isSnapshotDir || (Boolean(config.refSpec) && !hasExplicitNonFigmaAdapter)
         ? "figma"
         : config.adapter === "image" || isImageRef
           ? "image"
@@ -93,13 +114,27 @@ export async function check(
       refResult = await processHTMLReference(browser, config.ref || "ref.html", config, outputDir);
     }
 
+    // Single validation choke point: ensure reference spec is valid and non-empty (IDEA-01)
+    NormalizedSpecSchema.parse(refResult.spec);
+
+    const effectiveSelectorMap = {
+      ...(refResult.manifest?.selectorMap || {}),
+      ...(config.selectorMap || {}),
+    };
+
+    const userSpecifiedDpr =
+      userConfig.viewport && typeof userConfig.viewport.deviceScaleFactor === "number";
+    const initialDpr = userSpecifiedDpr
+      ? config.viewport.deviceScaleFactor
+      : (refResult.inferredDpr || config.viewport.deviceScaleFactor);
+
     // 3. Navigate to Live Target Page in an isolated BrowserContext
     targetContext = await browser.newContext({
       viewport: {
         width: config.viewport.width,
         height: config.viewport.height,
       },
-      deviceScaleFactor: config.viewport.deviceScaleFactor,
+      deviceScaleFactor: initialDpr,
       ignoreHTTPSErrors: config.ignoreHttpsErrors,
     });
 
@@ -111,18 +146,24 @@ export async function check(
     }
 
     // 4. Extract Live Page Telemetry, Mask Rects & Live Screenshot
-    let effectiveDpr = config.viewport.deviceScaleFactor;
+    let effectiveDpr = initialDpr;
     let liveTelemetry = await extractPageTelemetry(
       page,
       config.selector,
       liveScreenshotPath,
-      config.maskSelectors
+      config.maskSelectors,
+      Object.keys(effectiveSelectorMap).length > 0 ? effectiveSelectorMap : undefined
     );
 
     // Smart 1x Screenshot Support: if user supplied a 1x raster PNG/JPG/WEBP matching 1x CSS dimensions
     // while DPR defaulted to 2, re-capture live at 1x DPR so 1x screenshots work without false DIMENSION_DRIFT.
     const isRasterImageRef = Boolean(cleanRefPath && /\.(png|jpe?g|webp)$/i.test(cleanRefPath));
-    if (effectiveAdapter === "image" && isRasterImageRef && effectiveDpr === 2) {
+    const shouldAutoDetect1x =
+      !userSpecifiedDpr &&
+      effectiveDpr === 2 &&
+      ((effectiveAdapter === "image" && isRasterImageRef) || effectiveAdapter === "figma");
+
+    if (shouldAutoDetect1x) {
       const refImgMeta = await sharp(refResult.refScreenshotPath).metadata();
       const refW = refImgMeta.width || 0;
       const refH = refImgMeta.height || 0;
@@ -130,8 +171,10 @@ export async function check(
       const cssH = Math.round(liveTelemetry.rootRect.height);
       if (Math.abs(refW - cssW) <= 2 && Math.abs(refH - cssH) <= 2 && cssW > 0 && cssH > 0) {
         effectiveDpr = 1;
-        refResult.spec.nodes[0].rect.width = refW;
-        refResult.spec.nodes[0].rect.height = refH;
+        if (effectiveAdapter === "image" && refResult.spec.nodes[0]) {
+          refResult.spec.nodes[0].rect.width = refW;
+          refResult.spec.nodes[0].rect.height = refH;
+        }
         const ctx1x = await browser.newContext({
           viewport: { width: config.viewport.width, height: config.viewport.height },
           deviceScaleFactor: 1,
@@ -156,10 +199,15 @@ export async function check(
     }
 
     // 5. Gate 1: Deterministic Style & Geometry Check
+    const configWithEffectiveSelectorMap = {
+      ...config,
+      selectorMap:
+        Object.keys(effectiveSelectorMap).length > 0 ? effectiveSelectorMap : undefined,
+    };
     const { styleViolations, geometryViolations } = compareTelemetryWithSpec(
       liveTelemetry.nodes,
       refResult.spec.nodes,
-      config
+      configWithEffectiveSelectorMap
     );
 
     // Lazy CDP Inspection: zero overhead on green runs, single shared session on violations
@@ -251,6 +299,9 @@ export async function check(
       geometryViolations,
       pixelDiff,
       summary,
+      ...(refResult.warnings && refResult.warnings.length > 0
+        ? { warnings: refResult.warnings }
+        : {}),
     };
 
     return DeltaPacketSchema.parse(deltaPacket);

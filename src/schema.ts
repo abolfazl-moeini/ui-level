@@ -64,6 +64,8 @@ export type StyleSpec = z.infer<typeof StyleSpecSchema>;
 export const NodeSpecSchema = z.object({
   id: z.string(),
   figmaId: z.string().optional(),
+  mappedRefId: z.string().optional(),
+  mappedRefIds: z.array(z.string()).optional(),
   selector: z.string(),
   tagName: z.string().optional(),
   classes: z.array(z.string()).optional(),
@@ -80,7 +82,7 @@ export type NodeSpec = z.infer<typeof NodeSpecSchema>;
 export const NormalizedSpecSchema = z.object({
   adapter: z.enum(["html", "figma", "image"]),
   viewport: ViewportSchema,
-  nodes: z.array(NodeSpecSchema),
+  nodes: z.array(NodeSpecSchema).min(1, "NormalizedSpec must contain at least one node"),
   imagePath: z.string().optional(),
 });
 
@@ -152,6 +154,46 @@ export const PixelDiffSummarySchema = z.object({
 
 export type PixelDiffSummary = z.infer<typeof PixelDiffSummarySchema>;
 
+export const ReferenceManifestSchema = z.object({
+  schemaVersion: z.literal(1).default(1),
+  slug: z.string().min(1),
+  source: z.enum(["figwright", "figma-rest", "normalized", "html", "image"]),
+  exportedAt: z.string(),
+  figma: z
+    .object({
+      fileKey: z.string().optional(),
+      fileName: z.string().optional(),
+      nodeId: z.string().optional(),
+      nodeName: z.string().optional(),
+      revision: z.string().optional(),
+      colorProfile: z.enum(["SRGB", "DISPLAY_P3", "LEGACY"]).optional(),
+    })
+    .optional(),
+  figwright: z
+    .object({
+      serverVersion: z.string().optional(),
+      pluginVersion: z.string().optional(),
+      detail: z.enum(["minimal", "compact", "full"]).optional(),
+      dedupeComponents: z.boolean().optional(),
+    })
+    .optional(),
+  image: z.object({
+    file: z.string().default("reference.png"),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    deviceScaleFactor: z.number().positive(),
+  }),
+  specFile: z.string().default("reference.json"),
+  hashes: z.object({
+    specSha256: z.string().length(64),
+    imageSha256: z.string().length(64),
+  }),
+  selectorMap: z.record(z.string(), z.string()).optional(),
+  warnings: z.array(z.string()).default([]),
+});
+
+export type ReferenceManifest = z.infer<typeof ReferenceManifestSchema>;
+
 export const DeltaPacketSchema = z.object({
   status: z.enum(["pass", "fail"]),
   adapter: z.enum(["html", "figma", "image"]),
@@ -163,6 +205,7 @@ export const DeltaPacketSchema = z.object({
   geometryViolations: z.array(GeometryViolationSchema),
   pixelDiff: PixelDiffSummarySchema,
   summary: z.string(),
+  warnings: z.array(z.string()).optional(),
 });
 
 export type DeltaPacket = z.infer<typeof DeltaPacketSchema>;
@@ -186,6 +229,7 @@ export const ConfigSchema = z.object({
   maskSelectors: z.array(z.string()).default([]),
   injectCss: z.string().optional(),
   ignoreHttpsErrors: z.boolean().default(true),
+  skipIntegrityCheck: z.boolean().default(false),
   root: z.string().optional(),
   outputDir: z.string().default(".ui-level"),
   refSpec: z.string().optional(),
@@ -200,3 +244,4 @@ export const ConfigSchema = z.object({
 });
 
 export type UILevelConfig = z.infer<typeof ConfigSchema>;
+export type UserUILevelConfig = z.input<typeof ConfigSchema>;

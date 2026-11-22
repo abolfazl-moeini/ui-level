@@ -1,15 +1,59 @@
+import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 import type { Browser } from "playwright-core";
 import { check } from "../index.js";
 import { launchBrowser, resolveBrowserExecutable } from "../browser/resolver.js";
+import { importReferenceSnapshot } from "../snapshot/manager.js";
+
+export const McpImportSnapshotSchema = z.object({
+  slug: z.string().min(1),
+  specPath: z.string().min(1),
+  imagePath: z.string().min(1),
+  baseDir: z
+    .string()
+    .optional()
+    .refine(
+      (dir) => {
+        if (!dir) return true;
+        const resolved = path.resolve(process.cwd(), dir);
+        const rel = path.relative(process.cwd(), resolved);
+        return !rel.startsWith("..") && !path.isAbsolute(rel);
+      },
+      {
+        message: "baseDir must be within the project root directory",
+      }
+    ),
+  dpr: z.number().positive().optional(),
+  force: z.boolean().optional(),
+  selectorMap: z.record(z.string(), z.string()).optional(),
+  figma: z
+    .object({
+      fileKey: z.string().optional(),
+      fileName: z.string().optional(),
+      nodeId: z.string().optional(),
+      nodeName: z.string().optional(),
+      revision: z.string().optional(),
+      colorProfile: z.enum(["SRGB", "DISPLAY_P3", "LEGACY"]).optional(),
+    })
+    .optional(),
+  figwright: z
+    .object({
+      serverVersion: z.string().optional(),
+      pluginVersion: z.string().optional(),
+      detail: z.enum(["minimal", "compact", "full"]).optional(),
+      dedupeComponents: z.boolean().optional(),
+    })
+    .optional(),
+});
 
 export async function startMcpServer(): Promise<void> {
   const server = new Server(
     {
       name: "ui-level",
-      version: "1.0.0",
+      version: "1.1.0",
     },
     {
       capabilities: {
@@ -109,8 +153,49 @@ export async function startMcpServer(): Promise<void> {
                 type: "boolean",
                 default: true,
               },
+              skipIntegrityCheck: {
+                type: "boolean",
+                description: "Skip SHA-256 integrity verification for reference snapshots",
+                default: false,
+              },
             },
             required: ["targetUrl"],
+          },
+        },
+        {
+          name: "level_import_snapshot",
+          description:
+            "Import and freeze an immutable reference snapshot from a spec JSON and image PNG into .ui-level/references/<slug>/.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              slug: {
+                type: "string",
+                description: "Unique name/slug for the reference snapshot",
+              },
+              specPath: {
+                type: "string",
+                description: "Path to JSON spec (Figwright get_design_context or Figma REST)",
+              },
+              imagePath: {
+                type: "string",
+                description: "Path to PNG/JPG reference image",
+              },
+              baseDir: {
+                type: "string",
+                description: "Base output directory (default: .ui-level/references)",
+              },
+              dpr: {
+                type: "number",
+                description: "Optional device scale factor (default: auto-detected 1 or 2)",
+              },
+              selectorMap: {
+                type: "object",
+                additionalProperties: { type: "string" },
+                description: "Optional mapping from selectors to Figma IDs",
+              },
+            },
+            required: ["slug", "specPath", "imagePath"],
           },
         },
         {
@@ -152,6 +237,26 @@ export async function startMcpServer(): Promise<void> {
         return {
           isError: true,
           content: [{ type: "text", text: `Doctor failed: ${err?.message || "unknown"}` }],
+        };
+      }
+    }
+
+    if (name === "level_import_snapshot") {
+      try {
+        const validated = McpImportSnapshotSchema.parse(args || {});
+        const res = await importReferenceSnapshot(validated);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(res, null, 2),
+            },
+          ],
+        };
+      } catch (err: any) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Import snapshot error: ${err?.message || "unknown"}` }],
         };
       }
     }

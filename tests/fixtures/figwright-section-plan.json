@@ -1,0 +1,11 @@
+{
+  "sectionPlan": {
+    "sections": [
+      {
+        "nodeId": "100:1",
+        "name": "Header Section"
+      }
+    ]
+  },
+  "note": "Tree too large, re-run per section."
+}

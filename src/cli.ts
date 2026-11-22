@@ -12,13 +12,52 @@ import {
   getDaemonSocketPath,
 } from "./browser/daemon.js";
 import { startMcpServer } from "./mcp/server.js";
-import type { DeltaPacket, UILevelConfig } from "./schema.js";
+import {
+  importReferenceSnapshot,
+  loadReferenceSnapshot,
+} from "./snapshot/manager.js";
+import { z } from "zod";
+import type { DeltaPacket, UILevelConfig, UserUILevelConfig } from "./schema.js";
 
 const program = new Command();
 
+const SelectorMapSchema = z.record(z.string(), z.string());
+
+function parseSelectorMapArg(val?: string): Record<string, string> | undefined {
+  if (!val) return undefined;
+  const trimmed = val.trim();
+  let parsed: unknown;
+  if (trimmed.startsWith("{")) {
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err: any) {
+      throw new Error(`Invalid JSON passed to --selector-map: ${err.message}`);
+    }
+  } else {
+    const resolved = path.resolve(trimmed);
+    if (fs.existsSync(resolved)) {
+      try {
+        parsed = JSON.parse(fs.readFileSync(resolved, "utf-8"));
+      } catch (err: any) {
+        throw new Error(`Failed to read selectorMap file '${trimmed}': ${err.message}`);
+      }
+    } else {
+      throw new Error(`--selector-map file not found or invalid JSON: ${trimmed}`);
+    }
+  }
+
+  const result = SelectorMapSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `--selector-map must be an object of { [selector]: string }: ${result.error.message}`
+    );
+  }
+  return result.data;
+}
+
 function isRemoteOrFigmaId(val?: string): boolean {
   if (!val) return true;
-  if (val.startsWith("http://") || val.startsWith("https://")) return true;
+  if (val.startsWith("http://") || val.startsWith("https://") || val.startsWith("data:")) return true;
   // Treat explicit fileKey:nodeId without path separators or extension as Figma shorthand
   if (val.includes(":") && !val.includes("/") && !val.includes("\\") && !/\.[a-z0-9]+$/i.test(val)) {
     return true;
@@ -66,13 +105,13 @@ async function ensureWarmDaemon(): Promise<boolean> {
 program
   .name("ui-level")
   .description("Deterministic visual & CSS spec regression engine for modern UI workflows")
-  .version("1.0.0");
+  .version("1.1.0");
 
 program
   .command("check")
   .description("Run visual & CSS regression check between target and reference")
   .option("-t, --target <url|file>", "Target URL or local HTML file")
-  .option("-r, --ref <url|file|key>", "Reference HTML, image, or Figma node/URL")
+  .option("-r, --ref <url|file|key|dir>", "Reference HTML, image, Figma node/URL, or snapshot directory")
   .option("-a, --adapter <type>", "Adapter type: html, figma, image")
   .option("-s, --selector <css>", "CSS selector to inspect")
   .option("--ref-selector <css>", "CSS selector in reference HTML (defaults to --selector)")
@@ -80,6 +119,8 @@ program
   .option("--viewport <WxH>", "Viewport size, e.g. 1280x800")
   .option("--dpr <number>", "Device scale factor (e.g. 1 or 2)", parseFloat)
   .option("-c, --config <path>", "Path to ui-level.config.json")
+  .option("--selector-map <jsonOrFile>", "Explicit mapping between selectors and Figma IDs")
+  .option("--skip-integrity", "Skip SHA-256 integrity verification for reference snapshots")
   .option("--mask <selectors...>", "Selectors to mask from pixel diff")
   .option("--inject-css <css>", "Custom CSS to inject into target page")
   .option("--root <dir>", "Project root directory")
@@ -117,25 +158,39 @@ program
 
       const cliSet = (name: string) => cmd.getOptionValueSource(name) === "cli";
 
+      const hasExplicitDpr = cliSet("dpr") || fileConfig.viewport?.deviceScaleFactor !== undefined;
+
       const mergedViewport =
         options.viewport || cliSet("dpr")
           ? {
-              deviceScaleFactor: cliSet("dpr")
-                ? options.dpr
-                : fileConfig.viewport?.deviceScaleFactor ?? 2,
+              ...(hasExplicitDpr
+                ? {
+                    deviceScaleFactor: cliSet("dpr")
+                      ? options.dpr
+                      : fileConfig.viewport?.deviceScaleFactor,
+                  }
+                : {}),
               width: fileConfig.viewport?.width ?? 1280,
               height: fileConfig.viewport?.height ?? 800,
               ...(options.viewport ? parseViewportFlag(options.viewport) : {}),
             }
           : fileConfig.viewport;
 
-      const mergedConfig: Partial<UILevelConfig> = {
+      const cliSelectorMap = options.selectorMap
+        ? parseSelectorMapArg(options.selectorMap)
+        : undefined;
+
+      const mergedConfig: UserUILevelConfig = {
         ...fileConfig,
         targetUrl: cliSet("target") ? options.target : fileConfig.targetUrl || "index.html",
         ref: cliSet("ref") ? options.ref : fileConfig.ref,
         adapter: cliSet("adapter") ? (options.adapter as any) : fileConfig.adapter || "html",
         selector: cliSet("selector") ? options.selector : fileConfig.selector || "body",
         refSelector: cliSet("refSelector") ? options.refSelector : fileConfig.refSelector,
+        selectorMap: cliSelectorMap || fileConfig.selectorMap,
+        skipIntegrityCheck: cliSet("skipIntegrity")
+          ? options.skipIntegrity
+          : fileConfig.skipIntegrityCheck ?? false,
         threshold: cliSet("threshold") ? options.threshold : fileConfig.threshold,
         maskSelectors: cliSet("mask")
           ? [...(fileConfig.maskSelectors || []), ...(options.mask || [])]
@@ -155,7 +210,7 @@ program
 
       if (options.daemon) {
         const cwd = process.cwd();
-        const daemonPayload: Partial<UILevelConfig> = {
+        const daemonPayload: UserUILevelConfig = {
           ...mergedConfig,
           targetUrl: resolveLocalPathIfAny(mergedConfig.targetUrl, cwd),
           ref: resolveLocalPathIfAny(mergedConfig.ref, cwd),
@@ -360,10 +415,138 @@ program
       selector: "body",
       maskSelectors: [],
       ignoreHttpsErrors: true,
+      skipIntegrityCheck: false,
       outputDir: ".ui-level",
     };
     fs.writeFileSync(targetFile, JSON.stringify(template, null, 2), "utf-8");
     console.log(`\x1b[32mCreated ${targetFile}\x1b[0m`);
+  });
+
+const snapshotCmd = program
+  .command("snapshot")
+  .description("Manage immutable reference snapshot bundles");
+
+snapshotCmd
+  .command("import")
+  .description("Import and freeze an immutable reference snapshot from spec & image")
+  .requiredOption("--slug <slug>", "Unique slug for the reference component")
+  .requiredOption("--spec <path>", "Path to reference spec JSON (Figwright or Figma REST)")
+  .requiredOption("--image <path>", "Path to reference image PNG/JPG")
+  .option("--out <dir>", "Base directory for references", ".ui-level/references")
+  .option("--dpr <number>", "Device scale factor override (e.g. 1 or 2)", parseFloat)
+  .option("--selector-map <jsonOrFile>", "Optional selectorMap for component matching")
+  .option("--figma-file <key>", "Figma file key")
+  .option("--figma-name <name>", "Figma file name")
+  .option("--node-id <id>", "Figma node ID")
+  .option("--node-name <name>", "Figma node name")
+  .option("--revision <rev>", "Figma file revision / version")
+  .option("--figwright-version <ver>", "Figwright version")
+  .option("--plugin-version <ver>", "Figwright plugin version")
+  .option("--detail <detail>", "Figwright detail level ('minimal' | 'compact' | 'full')")
+  .option("--force", "Overwrite existing reference snapshot with same slug")
+  .option("--json", "Output result as JSON")
+  .action(async (options) => {
+    try {
+      const selectorMap = options.selectorMap ? parseSelectorMapArg(options.selectorMap) : undefined;
+      const figmaOpts =
+        options.figmaFile || options.figmaName || options.nodeId || options.nodeName || options.revision
+          ? {
+              fileKey: options.figmaFile,
+              fileName: options.figmaName,
+              nodeId: options.nodeId,
+              nodeName: options.nodeName,
+              revision: options.revision,
+            }
+          : undefined;
+
+      const figwrightOpts =
+        options.figwrightVersion || options.pluginVersion || options.detail
+          ? {
+              serverVersion: options.figwrightVersion,
+              pluginVersion: options.pluginVersion,
+              detail: options.detail,
+            }
+          : undefined;
+
+      const res = await importReferenceSnapshot({
+        slug: options.slug,
+        specPath: options.spec,
+        imagePath: options.image,
+        baseDir: options.out,
+        dpr: options.dpr,
+        force: options.force,
+        selectorMap,
+        figma: figmaOpts,
+        figwright: figwrightOpts,
+      });
+
+      if (options.json) {
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        console.log(`\x1b[32mSuccessfully imported reference snapshot '${options.slug}'\x1b[0m`);
+        console.log(`Location:   ${res.snapshotDir}`);
+        console.log(`Source:     ${res.manifest.source}`);
+        console.log(`Dimensions: ${res.manifest.image.width}x${res.manifest.image.height} @ DPR ${res.manifest.image.deviceScaleFactor}`);
+        console.log(
+          `SHA-256:    spec=${res.manifest.hashes.specSha256.slice(0, 12)}... image=${res.manifest.hashes.imageSha256.slice(0, 12)}...`
+        );
+        if (res.manifest.warnings && res.manifest.warnings.length > 0) {
+          console.log("\n\x1b[33mWarnings:\x1b[0m");
+          for (const w of res.manifest.warnings) {
+            console.log(`  ! ${w}`);
+          }
+        }
+      }
+      process.exit(0);
+    } catch (err: any) {
+      if (options.json) {
+        console.log(JSON.stringify({ success: false, error: err.message }, null, 2));
+      } else {
+        console.error(`\x1b[31mSnapshot import failed: ${err.message}\x1b[0m`);
+      }
+      process.exit(2);
+    }
+  });
+
+snapshotCmd
+  .command("verify")
+  .description("Verify integrity of a reference snapshot directory against its manifest")
+  .argument("<dir>", "Path to snapshot directory")
+  .option("--json", "Output result as JSON")
+  .action((dir, options) => {
+    try {
+      const loaded = loadReferenceSnapshot(dir);
+      if (options.json) {
+        console.log(
+          JSON.stringify(
+            { valid: true, manifest: loaded.manifest, warnings: loaded.warnings },
+            null,
+            2
+          )
+        );
+      } else {
+        console.log(`\x1b[32mSnapshot integrity verified: ${dir}\x1b[0m`);
+        if (loaded.manifest) {
+          console.log(`Slug:       ${loaded.manifest.slug}`);
+          console.log(`Source:     ${loaded.manifest.source}`);
+          console.log(`Dimensions: ${loaded.manifest.image.width}x${loaded.manifest.image.height}`);
+        }
+        if (loaded.warnings.length > 0) {
+          console.log("\n\x1b[33mWarnings:\x1b[0m");
+          for (const w of loaded.warnings) {
+            console.log(`  ! ${w}`);
+          }
+        }
+      }
+      process.exit(0);
+    } catch (err: any) {
+      if (options.json) {
+        console.log(JSON.stringify({ valid: false, error: err.message }, null, 2));
+      } else {
+        console.error(`\x1b[31mVerification failed: ${err.message}\x1b[0m`);
+      }
+      process.exit(2);
+    }
   });
 
 function renderHumanReport(packet: DeltaPacket): void {
@@ -376,6 +559,14 @@ function renderHumanReport(packet: DeltaPacket): void {
   console.log(`Target:   ${packet.targetUrl}`);
   console.log(`Ref:      ${packet.refSource} (${packet.adapter})`);
   console.log(`Duration: ${packet.durationMs}ms\n`);
+
+  if (packet.warnings && packet.warnings.length > 0) {
+    console.log(`\x1b[33mWarnings (${packet.warnings.length}):\x1b[0m`);
+    for (const w of packet.warnings) {
+      console.log(`  ! \x1b[33m${w}\x1b[0m`);
+    }
+    console.log("");
+  }
 
   if (packet.styleViolations.length > 0) {
     console.log(`\x1b[33mGate 1: Style Violations (${packet.styleViolations.length}):\x1b[0m`);

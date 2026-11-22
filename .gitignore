@@ -3,4 +3,5 @@ dist/
 .DS_Store
 .test-output/
 .ui-level/
+.workbuddy-ai/
 *.log

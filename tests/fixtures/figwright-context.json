@@ -1,0 +1,110 @@
+{
+  "nodes": [
+    {
+      "id": "100:1",
+      "name": "Card",
+      "type": "FRAME",
+      "x": 0,
+      "y": 0,
+      "width": 354,
+      "height": 134,
+      "cornerRadius": 12,
+      "fill": "fill_card",
+      "layout": {
+        "mode": "VERTICAL",
+        "paddingTop": 16,
+        "paddingRight": 16,
+        "paddingBottom": 16,
+        "paddingLeft": 16,
+        "itemSpacing": 12
+      },
+      "children": [
+        {
+          "id": "100:2",
+          "name": "Card Title",
+          "type": "TEXT",
+          "x": 16,
+          "y": 16,
+          "width": 322,
+          "height": 24,
+          "characters": "تست عنوان کارت",
+          "textStyle": "text_title",
+          "fill": "fill_title"
+        },
+        {
+          "id": "100:3",
+          "name": "Actions Group",
+          "type": "GROUP",
+          "x": 16,
+          "y": 52,
+          "width": 322,
+          "height": 40,
+          "children": [
+            {
+              "id": "100:4",
+              "name": "Submit Button",
+              "type": "FRAME",
+              "x": 16,
+              "y": 52,
+              "width": 80,
+              "height": 36,
+              "cornerRadius": 8,
+              "fill": "fill_btn",
+              "layout": {
+                "mode": "HORIZONTAL",
+                "paddingTop": 8,
+                "paddingRight": 16,
+                "paddingBottom": 8,
+                "paddingLeft": 16
+              }
+            },
+            {
+              "id": "100:5",
+              "name": "Badge Instance",
+              "type": "INSTANCE",
+              "x": 104,
+              "y": 52,
+              "width": 50,
+              "height": 24,
+              "deduped": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "globalVars": {
+    "styles": {
+      "fill_card": [
+        {
+          "type": "SOLID",
+          "color": "#FFFFFF",
+          "visible": true
+        }
+      ],
+      "fill_title": [
+        {
+          "type": "SOLID",
+          "color": "#111827",
+          "visible": true
+        }
+      ],
+      "fill_btn": [
+        {
+          "type": "SOLID",
+          "color": "#2563EB",
+          "visible": true
+        }
+      ],
+      "text_title": {
+        "fontFamily": "Vazirmatn",
+        "fontStyle": "Bold",
+        "fontSize": 18,
+        "lineHeight": {
+          "unit": "PIXELS",
+          "value": 24
+        }
+      }
+    }
+  }
+}

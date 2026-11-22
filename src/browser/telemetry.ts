@@ -16,19 +16,58 @@ export interface TelemetryExtractionResult {
   screenshotBuffer: Buffer;
 }
 
+export const FIGMA_NODE_ID_RE = /^(?:I?\d+[:;-]\d+(?:;\d+[:;-]\d+)*)$/;
+
+export function normalizeFigmaId(id: string): string {
+  if (!id) return id;
+  const trimmed = id.trim();
+  if (FIGMA_NODE_ID_RE.test(trimmed)) {
+    const unprefixed = trimmed.startsWith("I") ? trimmed.slice(1) : trimmed;
+    return unprefixed.replace(/-/g, ":");
+  }
+  return trimmed;
+}
+
+export function normalizeRefKey(key: string): string {
+  return normalizeFigmaId(key);
+}
+
+export function normalizeSelectorMapEntries(
+  selectorMap?: Record<string, string>
+): Array<{ cssSelector: string; refId: string }> {
+  if (!selectorMap) return [];
+  const pairs: Array<{ cssSelector: string; refId: string }> = [];
+  for (const [k, v] of Object.entries(selectorMap)) {
+    if (FIGMA_NODE_ID_RE.test(k) && !FIGMA_NODE_ID_RE.test(v)) {
+      // { "123:456": "#navbar" } -> cssSelector="#navbar", refId="123:456"
+      pairs.push({ cssSelector: v, refId: k.replace(/-/g, ":") });
+    } else {
+      // { "#navbar": "123:456" } -> cssSelector="#navbar", refId="123:456"
+      pairs.push({
+        cssSelector: k,
+        refId: FIGMA_NODE_ID_RE.test(v) ? v.replace(/-/g, ":") : v,
+      });
+    }
+  }
+  return pairs;
+}
+
 export async function extractPageTelemetry(
   page: Page,
   rootSelector: string = "body",
   screenshotPath?: string,
-  maskSelectors: string[] = []
+  maskSelectors: string[] = [],
+  selectorMap?: Record<string, string>
 ): Promise<TelemetryExtractionResult> {
   const locator = page.locator(rootSelector).first();
   await locator.waitFor({ state: "attached", timeout: 10000 });
 
+  const mapPairs = normalizeSelectorMapEntries(selectorMap);
+
   // Evaluate DOM telemetry AND maskSelectors in a single pre-scroll pass
   // so rootRect, textRects, and maskRects share the exact same viewport origin.
   const extraction = await locator.evaluate(
-    (rootEl: Element, masks: string[]) => {
+    (rootEl: Element, { masks, mapPairs }: { masks: string[]; mapPairs: Array<{ cssSelector: string; refId: string }> }) => {
       function parsePx(val: string | null | undefined): number | undefined {
         if (!val || val === "normal" || val === "none" || val === "auto") return undefined;
         const num = parseFloat(val);
@@ -208,12 +247,38 @@ export async function extractPageTelemetry(
           height: bcr.height,
         };
 
-        const figmaId = el.getAttribute("data-figma-id") || undefined;
+        const rawFigmaId =
+          el.getAttribute("data-figma-id") ||
+          el.getAttribute("data-figma-node-id") ||
+          undefined;
+        const figmaId = rawFigmaId
+          ? (/^(?:I?\d+[:;-]\d+(?:;\d+[:;-]\d+)*)$/.test(rawFigmaId)
+              ? (rawFigmaId.startsWith("I") ? rawFigmaId.slice(1) : rawFigmaId).replace(/-/g, ":")
+              : rawFigmaId)
+          : undefined;
+
+        let mappedRefId: string | undefined;
+        const mappedRefIds: string[] = [];
+        if (mapPairs && mapPairs.length > 0) {
+          for (const pair of mapPairs) {
+            try {
+              if (el.matches(pair.cssSelector)) {
+                mappedRefIds.push(pair.refId);
+              }
+            } catch {
+              // Ignore invalid CSS selector
+            }
+          }
+        }
+        mappedRefId = mappedRefIds[0];
+
         const classes = Array.from(el.classList);
 
         nodes.push({
           id: el.id || selector,
           figmaId,
+          mappedRefId,
+          mappedRefIds: mappedRefIds.length > 0 ? mappedRefIds : undefined,
           selector,
           tagName: el.tagName.toLowerCase(),
           classes: classes.length > 0 ? classes : undefined,
@@ -233,7 +298,7 @@ export async function extractPageTelemetry(
 
       return { nodes, rootRect, maskRects };
     },
-    maskSelectors
+    { masks: maskSelectors, mapPairs }
   );
 
   // Capture screenshot cleanly via Playwright locator (scrolls below-the-fold safely & freezes animations)
@@ -295,18 +360,64 @@ function resolveMatchedRef(
   usedRefs: Set<NodeSpec>,
   selectorMap?: Record<string, string>
 ): NodeSpec | undefined {
-  // Tier 0: Explicit selectorMap (live selector/id -> ref id/selector)
+  function findCandidate(rawKey: string): NodeSpec | undefined {
+    const normKey = normalizeRefKey(rawKey);
+    const withoutHash = normKey.replace(/^#/, "");
+    return (
+      refMatchers.byId.get(normKey) ||
+      refMatchers.byId.get(withoutHash) ||
+      refMatchers.bySelector.get(normKey) ||
+      refMatchers.bySelector.get(`[data-figma-id="${normKey}"]`) ||
+      refMatchers.bySelector.get(`[data-figma-node-id="${normKey}"]`)
+    );
+  }
+
+  // Tier 0a: In-DOM evaluated selectorMap
+  const domCandidateKeys =
+    live.mappedRefIds && live.mappedRefIds.length > 0
+      ? live.mappedRefIds
+      : live.mappedRefId
+        ? [live.mappedRefId]
+        : [];
+
+  for (const rawKey of domCandidateKeys) {
+    const cand = findCandidate(rawKey);
+    if (cand && !usedRefs.has(cand)) return cand;
+  }
+
+  // Tier 0b: Explicit selectorMap (live selector/id -> ref id/selector) or reverse
   if (selectorMap) {
-    const mapped = selectorMap[live.selector] || selectorMap[live.id];
+    const possibleLiveKeys = [live.selector, live.id, live.id ? `#${live.id}` : ""].filter(Boolean);
+    let mapped: string | undefined;
+    for (const k of possibleLiveKeys) {
+      if (selectorMap[k]) {
+        mapped = selectorMap[k];
+        break;
+      }
+    }
+
+    if (!mapped) {
+      // Check reverse mapping { "100:1": "#test-card" }
+      for (const [refKey, liveTarget] of Object.entries(selectorMap)) {
+        if (
+          liveTarget === live.selector ||
+          (live.id && (liveTarget === `#${live.id}` || liveTarget === live.id))
+        ) {
+          mapped = refKey;
+          break;
+        }
+      }
+    }
+
     if (mapped) {
-      const cand = refMatchers.byId.get(mapped) || refMatchers.bySelector.get(mapped);
+      const cand = findCandidate(mapped);
       if (cand && !usedRefs.has(cand)) return cand;
     }
   }
 
-  // Tier 1: Explicit ID or data-figma-id attribute
+  // Tier 1: Explicit ID or data-figma-id / data-figma-node-id attribute
   if (live.figmaId) {
-    const cand = refMatchers.byId.get(live.figmaId) || refMatchers.bySelector.get(`[data-figma-id="${live.figmaId}"]`);
+    const cand = findCandidate(live.figmaId);
     if (cand && !usedRefs.has(cand)) return cand;
   }
   if (live.id && live.id !== live.selector) {
