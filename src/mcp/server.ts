@@ -53,7 +53,7 @@ export async function startMcpServer(): Promise<void> {
   const server = new Server(
     {
       name: "ui-level",
-      version: "1.1.0",
+      version: "1.1.1",
     },
     {
       capabilities: {
@@ -189,10 +189,37 @@ export async function startMcpServer(): Promise<void> {
                 type: "number",
                 description: "Optional device scale factor (default: auto-detected 1 or 2)",
               },
+              force: {
+                type: "boolean",
+                description: "Overwrite an existing reference snapshot with the same slug",
+                default: false,
+              },
               selectorMap: {
                 type: "object",
                 additionalProperties: { type: "string" },
                 description: "Optional mapping from selectors to Figma IDs",
+              },
+              figma: {
+                type: "object",
+                properties: {
+                  fileKey: { type: "string" },
+                  fileName: { type: "string" },
+                  nodeId: { type: "string" },
+                  nodeName: { type: "string" },
+                  revision: { type: "string" },
+                  colorProfile: { type: "string", enum: ["SRGB", "DISPLAY_P3", "LEGACY"] },
+                },
+                description: "Optional Figma provenance metadata",
+              },
+              figwright: {
+                type: "object",
+                properties: {
+                  serverVersion: { type: "string" },
+                  pluginVersion: { type: "string" },
+                  detail: { type: "string", enum: ["minimal", "compact", "full"] },
+                  dedupeComponents: { type: "boolean" },
+                },
+                description: "Optional Figwright capture metadata",
               },
             },
             required: ["slug", "specPath", "imagePath"],

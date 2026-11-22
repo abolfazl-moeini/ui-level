@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import sharp from "sharp";
 import {
   NormalizedSpecSchema,
   type NormalizedSpec,
@@ -104,6 +105,16 @@ async function tryFetchLocalVariables(
   return vars;
 }
 
+async function writeValidPng(srcPath: string, destPath: string): Promise<void> {
+  if (path.resolve(srcPath) === path.resolve(destPath)) return;
+  const meta = await sharp(srcPath).metadata();
+  if (meta.format === "png") {
+    fs.copyFileSync(srcPath, destPath);
+  } else {
+    await sharp(srcPath).png().toFile(destPath);
+  }
+}
+
 export async function processFigmaReference(
   config: UILevelConfig,
   outputDir: string,
@@ -127,7 +138,7 @@ export async function processFigmaReference(
       skipIntegrityCheck: config.skipIntegrityCheck,
       viewport: config.viewport,
     });
-    fs.copyFileSync(loaded.imagePath, refScreenshotPath);
+    await writeValidPng(loaded.imagePath, refScreenshotPath);
     return {
       spec: loaded.spec,
       refScreenshotPath,
@@ -144,7 +155,7 @@ export async function processFigmaReference(
   const refImagePath =
     options.refImagePath ||
     config.refImage ||
-    (config.ref?.endsWith(".png") ? config.ref : undefined);
+    (config.ref && /\.(png|jpe?g|webp)$/i.test(config.ref) ? config.ref : undefined);
 
   // 2. Offline Mode: Local spec &/or image provided (for Figma MCP or offline bundles)
   if (refSpecPath || refImagePath) {
@@ -182,13 +193,13 @@ export async function processFigmaReference(
       if (!fs.existsSync(refImagePath)) {
         throw new Error(`Figma offline reference image not found: ${refImagePath}`);
       }
-      fs.copyFileSync(refImagePath, refScreenshotPath);
+      await writeValidPng(refImagePath, refScreenshotPath);
     } else if (
       spec.imagePath &&
       fs.existsSync(spec.imagePath) &&
       path.resolve(spec.imagePath) !== path.resolve(refScreenshotPath)
     ) {
-      fs.copyFileSync(spec.imagePath, refScreenshotPath);
+      await writeValidPng(spec.imagePath, refScreenshotPath);
     } else {
       throw new Error(
         "Figma offline spec mode requires an associated reference PNG via --ref-image or config.refImage."

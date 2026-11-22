@@ -40,12 +40,12 @@ export function normalizeSelectorMapEntries(
   for (const [k, v] of Object.entries(selectorMap)) {
     if (FIGMA_NODE_ID_RE.test(k) && !FIGMA_NODE_ID_RE.test(v)) {
       // { "123:456": "#navbar" } -> cssSelector="#navbar", refId="123:456"
-      pairs.push({ cssSelector: v, refId: k.replace(/-/g, ":") });
+      pairs.push({ cssSelector: v, refId: normalizeFigmaId(k) });
     } else {
       // { "#navbar": "123:456" } -> cssSelector="#navbar", refId="123:456"
       pairs.push({
         cssSelector: k,
-        refId: FIGMA_NODE_ID_RE.test(v) ? v.replace(/-/g, ":") : v,
+        refId: normalizeFigmaId(v),
       });
     }
   }
@@ -333,6 +333,19 @@ function buildRefMatchers(refNodes: NodeSpec[]) {
   for (const r of refNodes) {
     if (r.id && r.id !== r.selector) {
       byId.set(r.id, r);
+      const normId = normalizeFigmaId(r.id);
+      if (normId !== r.id && !byId.has(normId)) {
+        byId.set(normId, r);
+      }
+    }
+    if (r.figmaId) {
+      if (!byId.has(r.figmaId)) {
+        byId.set(r.figmaId, r);
+      }
+      const normFigmaId = normalizeFigmaId(r.figmaId);
+      if (normFigmaId !== r.figmaId && !byId.has(normFigmaId)) {
+        byId.set(normFigmaId, r);
+      }
     }
     bySelector.set(r.selector, r);
 
@@ -388,28 +401,25 @@ function resolveMatchedRef(
   // Tier 0b: Explicit selectorMap (live selector/id -> ref id/selector) or reverse
   if (selectorMap) {
     const possibleLiveKeys = [live.selector, live.id, live.id ? `#${live.id}` : ""].filter(Boolean);
-    let mapped: string | undefined;
+    const tier0bCandidates: string[] = [];
+
     for (const k of possibleLiveKeys) {
       if (selectorMap[k]) {
-        mapped = selectorMap[k];
-        break;
+        tier0bCandidates.push(selectorMap[k]);
       }
     }
 
-    if (!mapped) {
-      // Check reverse mapping { "100:1": "#test-card" }
-      for (const [refKey, liveTarget] of Object.entries(selectorMap)) {
-        if (
-          liveTarget === live.selector ||
-          (live.id && (liveTarget === `#${live.id}` || liveTarget === live.id))
-        ) {
-          mapped = refKey;
-          break;
-        }
+    // Check reverse mapping { "100:1": "#test-card" }
+    for (const [refKey, liveTarget] of Object.entries(selectorMap)) {
+      if (
+        liveTarget === live.selector ||
+        (live.id && (liveTarget === `#${live.id}` || liveTarget === live.id))
+      ) {
+        tier0bCandidates.push(refKey);
       }
     }
 
-    if (mapped) {
+    for (const mapped of tier0bCandidates) {
       const cand = findCandidate(mapped);
       if (cand && !usedRefs.has(cand)) return cand;
     }

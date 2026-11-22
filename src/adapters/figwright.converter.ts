@@ -56,6 +56,11 @@ export function isFigwrightPayload(raw: unknown): boolean {
     return true;
   }
 
+  // 1b. Figwright over-budget sectionPlan stub ({ sectionPlan: { ... } })
+  if (obj.sectionPlan && typeof obj.sectionPlan === "object") {
+    return true;
+  }
+
   // 2. Figwright get_node result wrapper ({ node: SerializedNode })
   if (obj.node && typeof obj.node === "object" && typeof (obj.node as any).type === "string") {
     return true;
@@ -63,13 +68,16 @@ export function isFigwrightPayload(raw: unknown): boolean {
 
   // 3. Figwright get_design_context result ({ nodes: DesignContextNode[], ... })
   if (Array.isArray(obj.nodes)) {
-    if (obj.sectionPlan || obj.globalVars || obj.metrics) return true;
+    if (obj.globalVars || obj.metrics) return true;
     const first = obj.nodes[0] as any;
     if (
       first &&
       typeof first.id === "string" &&
       typeof first.type === "string" &&
-      !first.rect
+      !first.rect &&
+      !first.absoluteBoundingBox &&
+      !first.absoluteRenderBounds &&
+      !first.document
     ) {
       return true;
     }
@@ -120,13 +128,14 @@ export function parseHexOrRgbColor(
       return undefined;
     }
     const rgbMatch = trimmed.match(
-      /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/i
+      /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d*\.?\d+))?\s*\)$/i
     );
     if (rgbMatch) {
       const r = parseInt(rgbMatch[1], 10);
       const g = parseInt(rgbMatch[2], 10);
       const b = parseInt(rgbMatch[3], 10);
       const baseA = rgbMatch[4] !== undefined ? parseFloat(rgbMatch[4]) : 1;
+      if (isNaN(baseA)) return undefined;
       const a = Number((baseA * opacityOverride).toFixed(2));
       return a >= 0.999 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${a})`;
     }
@@ -220,6 +229,10 @@ export function convertFigwrightToNormalizedSpec(
 
   const rootNode = rawNodes[0];
   const rootBbox = rootNode.absoluteBoundingBox || rootNode.absoluteRenderBounds;
+  const rootCanvasOrigin = {
+    x: typeof rootBbox?.x === "number" ? rootBbox.x : 0,
+    y: typeof rootBbox?.y === "number" ? rootBbox.y : 0,
+  };
   const rootW = typeof rootNode.width === "number" ? rootNode.width : rootBbox?.width;
   const rootH = typeof rootNode.height === "number" ? rootNode.height : rootBbox?.height;
 
@@ -296,8 +309,7 @@ export function convertFigwrightToNormalizedSpec(
     const nodeBbox = node.absoluteBoundingBox || node.absoluteRenderBounds;
     const width = Number((node.width ?? nodeBbox?.width ?? 0).toFixed(2));
     const height = Number((node.height ?? nodeBbox?.height ?? 0).toFixed(2));
-    const nodeX = node.x ?? nodeBbox?.x ?? 0;
-    const nodeY = node.y ?? nodeBbox?.y ?? 0;
+    const hasRelativeCoords = typeof node.x === "number" && typeof node.y === "number";
 
     let nodeAbsX: number;
     let nodeAbsY: number;
@@ -307,7 +319,13 @@ export function convertFigwrightToNormalizedSpec(
     if (depth === 0) {
       nodeAbsX = 0;
       nodeAbsY = 0;
+    } else if (!hasRelativeCoords && nodeBbox && typeof nodeBbox.x === "number" && typeof nodeBbox.y === "number") {
+      // Canvas-absolute Figma REST bounding box: subtract root canvas origin directly
+      nodeAbsX = Number((nodeBbox.x - rootCanvasOrigin.x).toFixed(2));
+      nodeAbsY = Number((nodeBbox.y - rootCanvasOrigin.y).toFixed(2));
     } else {
+      const nodeX = node.x ?? 0;
+      const nodeY = node.y ?? 0;
       nodeAbsX = Number((frameOrigin.x + nodeX).toFixed(2));
       nodeAbsY = Number((frameOrigin.y + nodeY).toFixed(2));
     }

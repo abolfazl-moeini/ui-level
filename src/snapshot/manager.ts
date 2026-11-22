@@ -88,18 +88,19 @@ export function isSnapshotDirectory(targetPath?: string): boolean {
 export async function importReferenceSnapshot(
   options: SnapshotImportOptions
 ): Promise<{ snapshotDir: string; manifest: ReferenceManifest }> {
+  const trimmedSlug = (options.slug || "").trim();
   if (
-    !options.slug ||
-    options.slug.includes("/") ||
-    options.slug.includes("\\") ||
-    options.slug.includes("..") ||
-    options.slug.startsWith(".")
+    !trimmedSlug ||
+    trimmedSlug.includes("/") ||
+    trimmedSlug.includes("\\") ||
+    trimmedSlug.includes("..") ||
+    trimmedSlug.startsWith(".")
   ) {
     throw new Error(`Invalid snapshot slug '${options.slug}'.`);
   }
 
-  const cleanSlug = options.slug.trim().replace(/[^a-zA-Z0-9._-]/g, "-");
-  if (!cleanSlug || cleanSlug === ".") {
+  const cleanSlug = trimmedSlug.replace(/[^a-zA-Z0-9._-]/g, "-");
+  if (!cleanSlug || cleanSlug === "." || cleanSlug.startsWith(".")) {
     throw new Error(`Invalid snapshot slug '${options.slug}'.`);
   }
 
@@ -126,8 +127,7 @@ export async function importReferenceSnapshot(
     );
   }
 
-  fs.mkdirSync(snapshotDir, { recursive: true });
-
+  // Validate and normalize spec & image BEFORE creating snapshotDir (atomic on failure)
   const rawSpec = JSON.parse(fs.readFileSync(specPath, "utf-8"));
   let normalizedSpec: NormalizedSpec;
   let source: ReferenceManifest["source"] = "normalized";
@@ -156,6 +156,8 @@ export async function importReferenceSnapshot(
     throw new Error(`Unable to recognize spec format in: ${specPath}`);
   }
 
+  NormalizedSpecSchema.parse(normalizedSpec);
+
   // Inspect image dimensions via sharp
   const imgMeta = await sharp(imagePath).metadata();
   const imgWidth = imgMeta.width || 0;
@@ -165,24 +167,35 @@ export async function importReferenceSnapshot(
     throw new Error(`Invalid image dimensions for: ${imagePath}`);
   }
 
-  // Infer DPR
+  // Infer DPR (validating both width and height aspect ratio)
   let inferredDpr = options.dpr;
   if (!inferredDpr) {
     const rootWidth = normalizedSpec.nodes[0]?.rect.width;
+    const rootHeight = normalizedSpec.nodes[0]?.rect.height;
     if (rootWidth && rootWidth > 0) {
-      const ratio = imgWidth / rootWidth;
-      if (Math.abs(ratio - 1) <= 0.08) inferredDpr = 1;
-      else if (Math.abs(ratio - 2) <= 0.08) inferredDpr = 2;
-      else if (Math.abs(ratio - 3) <= 0.08) inferredDpr = 3;
+      const widthRatio = imgWidth / rootWidth;
+      if (Math.abs(widthRatio - 1) <= 0.08) inferredDpr = 1;
+      else if (Math.abs(widthRatio - 2) <= 0.08) inferredDpr = 2;
+      else if (Math.abs(widthRatio - 3) <= 0.08) inferredDpr = 3;
       else {
         warnings.push(
-          `Image width (${imgWidth}px) to reference root width (${rootWidth}px) ratio is ${ratio.toFixed(2)}, which does not reliably match DPR 1, 2, or 3. Defaulting to DPR 2; use --dpr to override.`
+          `Image width (${imgWidth}px) to reference root width (${rootWidth}px) ratio is ${widthRatio.toFixed(2)}, which does not reliably match DPR 1, 2, or 3. Defaulting to DPR 2; use --dpr to override.`
         );
+      }
+      if (inferredDpr && rootHeight && rootHeight > 0) {
+        const heightRatio = imgHeight / rootHeight;
+        if (Math.abs(heightRatio - inferredDpr) > 0.15) {
+          warnings.push(
+            `Image height (${imgHeight}px) to reference root height (${rootHeight}px) ratio (${heightRatio.toFixed(2)}) disagrees with width-inferred DPR ${inferredDpr} (aspect-ratio mismatch); verify the reference image is not cropped or override with --dpr.`
+          );
+        }
       }
     }
   }
   const deviceScaleFactor = inferredDpr || 2;
   normalizedSpec.viewport.deviceScaleFactor = deviceScaleFactor;
+
+  fs.mkdirSync(snapshotDir, { recursive: true });
 
   const targetSpecPath = path.join(snapshotDir, "reference.json");
   const targetImagePath = path.join(snapshotDir, "reference.png");

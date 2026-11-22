@@ -105,7 +105,7 @@ async function ensureWarmDaemon(): Promise<boolean> {
 program
   .name("ui-level")
   .description("Deterministic visual & CSS spec regression engine for modern UI workflows")
-  .version("1.1.0");
+  .version("1.1.1");
 
 program
   .command("check")
@@ -158,6 +158,10 @@ program
 
       const cliSet = (name: string) => cmd.getOptionValueSource(name) === "cli";
 
+      if (cliSet("dpr") && (Number.isNaN(options.dpr) || options.dpr <= 0)) {
+        throw new Error(`Invalid --dpr value. Expected a positive number (e.g. 1 or 2).`);
+      }
+
       const hasExplicitDpr = cliSet("dpr") || fileConfig.viewport?.deviceScaleFactor !== undefined;
 
       const mergedViewport =
@@ -184,7 +188,11 @@ program
         ...fileConfig,
         targetUrl: cliSet("target") ? options.target : fileConfig.targetUrl || "index.html",
         ref: cliSet("ref") ? options.ref : fileConfig.ref,
-        adapter: cliSet("adapter") ? (options.adapter as any) : fileConfig.adapter || "html",
+        ...(cliSet("adapter")
+          ? { adapter: options.adapter as any }
+          : fileConfig.adapter
+            ? { adapter: fileConfig.adapter }
+            : {}),
         selector: cliSet("selector") ? options.selector : fileConfig.selector || "body",
         refSelector: cliSet("refSelector") ? options.refSelector : fileConfig.refSelector,
         selectorMap: cliSelectorMap || fileConfig.selectorMap,
@@ -238,7 +246,11 @@ program
 
       process.exit(result.status === "pass" ? 0 : 1);
     } catch (err: any) {
-      console.error(`\x1b[31mError during check: ${err.message}\x1b[0m`);
+      if (options.json) {
+        console.log(JSON.stringify({ status: "error", error: err.message }, null, 2));
+      } else {
+        console.error(`\x1b[31mError during check: ${err.message}\x1b[0m`);
+      }
       process.exit(2);
     }
   });
@@ -447,6 +459,9 @@ snapshotCmd
   .option("--json", "Output result as JSON")
   .action(async (options) => {
     try {
+      if (options.dpr !== undefined && (Number.isNaN(options.dpr) || options.dpr <= 0)) {
+        throw new Error(`Invalid --dpr value. Expected a positive number (e.g. 1 or 2).`);
+      }
       const selectorMap = options.selectorMap ? parseSelectorMapArg(options.selectorMap) : undefined;
       const figmaOpts =
         options.figmaFile || options.figmaName || options.nodeId || options.nodeName || options.revision
