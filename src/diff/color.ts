@@ -63,6 +63,22 @@ export function compareColors(
     };
   }
 
+  // Phase 4: Channel rounding tolerance (±3 per 8-bit channel, browser rasterizer vs Skia rounding)
+  const rgbExp = cExpected.to("srgb");
+  const rgbAct = cActual.to("srgb");
+  const rDiff = Math.abs(Math.round((rgbExp.coords[0] ?? 0) * 255) - Math.round((rgbAct.coords[0] ?? 0) * 255));
+  const gDiff = Math.abs(Math.round((rgbExp.coords[1] ?? 0) * 255) - Math.round((rgbAct.coords[1] ?? 0) * 255));
+  const bDiff = Math.abs(Math.round((rgbExp.coords[2] ?? 0) * 255) - Math.round((rgbAct.coords[2] ?? 0) * 255));
+
+  if (rDiff <= 3 && gDiff <= 3 && bDiff <= 3) {
+    return {
+      match: true,
+      deltaE: 0,
+      expectedNormalized: cExpected.toString({ format: "rgba" }),
+      actualNormalized: cActual.toString({ format: "rgba" }),
+    };
+  }
+
   const deltaE = cExpected.deltaE(cActual, "2000");
   const match = deltaE <= maxDeltaE;
 

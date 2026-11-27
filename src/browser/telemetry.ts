@@ -8,12 +8,16 @@ import type {
   UILevelConfig,
 } from "../schema.js";
 import { compareColors } from "../diff/color.js";
+import { cleanFontFamilyName, extractSemanticSkeleton } from "../diff/skeleton.js";
 
 export interface TelemetryExtractionResult {
   nodes: NodeSpec[];
   rootRect: GeometryRect;
   maskRects: GeometryRect[];
   screenshotBuffer: Buffer;
+  scrollWidth?: number;
+  viewportWidth?: number;
+  semanticSkeleton?: string[];
 }
 
 export const FIGMA_NODE_ID_RE = /^(?:I?\d+[:;-]\d+(?:;\d+[:;-]\d+)*)$/;
@@ -274,6 +278,12 @@ export async function extractPageTelemetry(
 
         const classes = Array.from(el.classList);
 
+        // Phase 4.3: Detect role or non-semantic clickable controls (div with onclick / explicit pointer)
+        let role = el.getAttribute("role") || undefined;
+        if (!role && (el.getAttribute("onclick") !== null || (el.tagName === "DIV" && ((el as HTMLElement).style.cursor === "pointer" || (cs.cursor === "pointer" && el.childElementCount === 0))))) {
+          role = "button";
+        }
+
         nodes.push({
           id: el.id || selector,
           figmaId,
@@ -281,6 +291,7 @@ export async function extractPageTelemetry(
           mappedRefIds: mappedRefIds.length > 0 ? mappedRefIds : undefined,
           selector,
           tagName: el.tagName.toLowerCase(),
+          role,
           classes: classes.length > 0 ? classes : undefined,
           direction: cs.direction === "rtl" ? "rtl" : "ltr",
           rect: {
@@ -296,7 +307,10 @@ export async function extractPageTelemetry(
         });
       }
 
-      return { nodes, rootRect, maskRects };
+      const scrollWidth = document.documentElement.scrollWidth;
+      const viewportWidth = window.innerWidth;
+
+      return { nodes, rootRect, maskRects, scrollWidth, viewportWidth };
     },
     { masks: maskSelectors, mapPairs }
   );
@@ -309,16 +323,22 @@ export async function extractPageTelemetry(
     path: screenshotPath,
   });
 
+  const semanticSkeleton = extractSemanticSkeleton(extraction.nodes);
+
   return {
     nodes: extraction.nodes,
     rootRect: extraction.rootRect,
     maskRects: extraction.maskRects,
     screenshotBuffer,
+    scrollWidth: extraction.scrollWidth,
+    viewportWidth: extraction.viewportWidth,
+    semanticSkeleton,
   };
 }
 
 function normalizeFontList(fontFamily: string): string[] {
-  return fontFamily
+  const cleaned = cleanFontFamilyName(fontFamily);
+  return cleaned
     .split(",")
     .map((f) => f.trim().replace(/^['"]|['"]$/g, "").toLowerCase())
     .filter(Boolean);

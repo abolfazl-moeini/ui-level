@@ -53,7 +53,7 @@ export async function startMcpServer(): Promise<void> {
   const server = new Server(
     {
       name: "ui-level",
-      version: "1.1.1",
+      version: "1.2.0",
     },
     {
       capabilities: {
@@ -156,6 +156,16 @@ export async function startMcpServer(): Promise<void> {
               skipIntegrityCheck: {
                 type: "boolean",
                 description: "Skip SHA-256 integrity verification for reference snapshots",
+                default: false,
+              },
+              autoNoiseMask: {
+                type: "boolean",
+                description: "Triple-shot noise masking to ignore animated/moving elements",
+                default: false,
+              },
+              commonArea: {
+                type: "boolean",
+                description: "Compare overlapping common area min(w1, w2) x min(h1, h2) instead of padding when heights differ",
                 default: false,
               },
             },

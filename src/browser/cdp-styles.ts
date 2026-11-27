@@ -244,3 +244,38 @@ export async function findWinningCssRule(
     }
   }
 }
+
+/**
+ * Phase 4.3: Discover event listeners on elements via CDP DOMDebugger.getEventListeners
+ */
+export async function getCdpEventListeners(
+  page: Page,
+  selector: string
+): Promise<string[]> {
+  try {
+    const client = await page.context().newCDPSession(page);
+    const doc = await client.send("DOM.getDocument", { depth: 0 });
+    const node = await client.send("DOM.querySelector", {
+      nodeId: doc.root.nodeId,
+      selector,
+    });
+    if (!node.nodeId) {
+      await client.detach();
+      return [];
+    }
+    const resolved = await client.send("DOM.resolveNode", { nodeId: node.nodeId });
+    if (!resolved.object.objectId) {
+      await client.detach();
+      return [];
+    }
+    const listeners = (await client.send("DOMDebugger.getEventListeners" as any, {
+      objectId: resolved.object.objectId,
+      depth: 1,
+    } as any)) as any;
+    await client.detach();
+    const eventTypes: string[] = (listeners?.listeners || []).map((l: any) => l.type);
+    return eventTypes;
+  } catch {
+    return [];
+  }
+}

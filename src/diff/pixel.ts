@@ -1,9 +1,12 @@
 import path from "node:path";
 import fs from "node:fs";
+import sharp from "sharp";
 import { compare, type ODiffOptions, type ODiffResult } from "odiff-bin";
 import type { GeometryRect, NodeSpec, PixelDiffSummary } from "../schema.js";
 import { normalizeImageDimensions } from "./triplet.js";
 import { extractDiffRegions } from "./regions.js";
+import type { NoiseMask } from "./noise-mask.js";
+import { computeBlockSimilarity, computePerceptualSimilarity } from "./similarity.js";
 
 export interface PixelDiffOptions {
   threshold?: number;
@@ -15,6 +18,9 @@ export interface PixelDiffOptions {
   adapter?: "html" | "figma" | "image";
   subpixelTolerancePx?: number;
   liveNodes?: NodeSpec[];
+  commonArea?: boolean;
+  noiseMask?: NoiseMask;
+  autoNoiseMask?: boolean;
 }
 
 export function transformRectsToIgnoreRegions(
@@ -51,12 +57,15 @@ export async function runPixelDiff(
   fs.rmSync(diffOutputPath, { force: true });
   fs.rmSync(path.join(outputDir, "ref_padded.png"), { force: true });
   fs.rmSync(path.join(outputDir, "live_padded.png"), { force: true });
+  fs.rmSync(path.join(outputDir, "ref_cropped.png"), { force: true });
+  fs.rmSync(path.join(outputDir, "live_cropped.png"), { force: true });
 
-  // 1. Normalize dimensions (Sentinel padding on DIMENSION_DRIFT)
+  // 1. Normalize dimensions (Sentinel padding or Common Area cropping)
   const normResult = await normalizeImageDimensions(
     refImagePath,
     liveImagePath,
-    outputDir
+    outputDir,
+    { commonArea: options.commonArea }
   );
 
   const { refDimensions, liveDimensions, unifiedDimensions } = normResult;
@@ -84,6 +93,16 @@ export async function runPixelDiff(
       unifiedDimensions
     );
     finalIgnoreRegions.push(...transformed);
+  }
+
+  // Phase 1: Incorporate NoiseMask ignore regions if provided
+  if (options.noiseMask && options.noiseMask.count() > 0) {
+    const noiseIgnore = options.noiseMask.toIgnoreRegions(
+      options.cropRect,
+      options.dpr || 1,
+      unifiedDimensions
+    );
+    finalIgnoreRegions.push(...noiseIgnore);
   }
 
   const odiffOptions: ODiffOptions = {
@@ -140,6 +159,29 @@ export async function runPixelDiff(
         )
       : undefined;
 
+  // Phase 2: Compute Layout & Perceptual (SSIM) similarity
+  let layoutSimilarity: number | undefined;
+  let perceptualSimilarity: number | undefined;
+
+  try {
+    const refRaw = await sharp(normResult.refPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const liveRaw = await sharp(normResult.livePath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    layoutSimilarity = computeBlockSimilarity(
+      { width: refRaw.info.width, height: refRaw.info.height, data: refRaw.data, channels: 4 },
+      { width: liveRaw.info.width, height: liveRaw.info.height, data: liveRaw.data, channels: 4 },
+      16,
+      24,
+      options.noiseMask
+    );
+    perceptualSimilarity = computePerceptualSimilarity(
+      { width: refRaw.info.width, height: refRaw.info.height, data: refRaw.data, channels: 4 },
+      { width: liveRaw.info.width, height: liveRaw.info.height, data: liveRaw.data, channels: 4 },
+      options.noiseMask
+    );
+  } catch {
+    // Graceful fallback if sharp fails to decode raw
+  }
+
   return {
     match,
     diffCount,
@@ -148,6 +190,10 @@ export async function runPixelDiff(
     refDimensions,
     liveDimensions,
     diffImagePath: diffExists ? diffOutputPath : undefined,
+    layoutSimilarity,
+    perceptualSimilarity,
+    commonAreaApplied: normResult.commonAreaApplied,
+    noiseTiles: options.noiseMask ? options.noiseMask.count() : undefined,
     ...(regions && regions.length > 0 ? { regions } : {}),
   };
 }

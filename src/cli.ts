@@ -105,7 +105,7 @@ async function ensureWarmDaemon(): Promise<boolean> {
 program
   .name("ui-level")
   .description("Deterministic visual & CSS spec regression engine for modern UI workflows")
-  .version("1.1.1");
+  .version("1.2.0");
 
 program
   .command("check")
@@ -129,6 +129,8 @@ program
   .option("--ref-image <path>", "Offline reference PNG image path (Figma MCP)")
   .option("--ignore-https-errors", "Ignore HTTPS certificate errors")
   .option("--no-ignore-https-errors", "Enforce strict HTTPS certificates")
+  .option("--auto-noise-mask", "Triple-shot noise masking to ignore animated/moving elements")
+  .option("--common-area", "Compare overlapping common area min(w1, w2) x min(h1, h2)")
   .option("--daemon", "Use background daemon for sub-350ms warm execution")
   .option("--json", "Output pure JSON DeltaPacket to stdout")
   .action(async (options, cmd) => {
@@ -211,6 +213,12 @@ program
         ignoreHttpsErrors: cliSet("ignoreHttpsErrors")
           ? options.ignoreHttpsErrors
           : fileConfig.ignoreHttpsErrors,
+        autoNoiseMask: cliSet("autoNoiseMask")
+          ? options.autoNoiseMask
+          : fileConfig.autoNoiseMask ?? false,
+        commonArea: cliSet("commonArea")
+          ? options.commonArea
+          : fileConfig.commonArea ?? false,
         ...(mergedViewport ? { viewport: mergedViewport } : {}),
       };
 
@@ -429,6 +437,9 @@ program
       ignoreHttpsErrors: true,
       skipIntegrityCheck: false,
       outputDir: ".ui-level",
+      autoNoiseMask: false,
+      commonArea: false,
+      noiseThreshold: 24,
     };
     fs.writeFileSync(targetFile, JSON.stringify(template, null, 2), "utf-8");
     console.log(`\x1b[32mCreated ${targetFile}\x1b[0m`);
@@ -619,6 +630,21 @@ function renderHumanReport(packet: DeltaPacket): void {
   console.log(`  Match:           ${packet.pixelDiff.match ? "YES" : "NO"}`);
   console.log(`  Diff Count:      ${packet.pixelDiff.diffCount} px (${packet.pixelDiff.diffPercentage}%)`);
   console.log(`  Dimension Drift: ${packet.pixelDiff.dimensionDrift ? "YES" : "NO"}`);
+  if (packet.pixelDiff.layoutSimilarity !== undefined) {
+    const layoutPct = (packet.pixelDiff.layoutSimilarity * 100).toFixed(1);
+    const detailPct = ((packet.pixelDiff.perceptualSimilarity ?? 0) * 100).toFixed(1);
+    console.log(`  Layout Alike:    ${layoutPct}%`);
+    console.log(`  Detail (SSIM):   ${detailPct}%`);
+  }
+  if (packet.pixelDiff.noiseTiles !== undefined && packet.pixelDiff.noiseTiles > 0) {
+    console.log(`  Noise Mask:      ${packet.pixelDiff.noiseTiles} animated tile(s) ignored`);
+  }
+  if (packet.pixelDiff.commonAreaApplied) {
+    console.log(`  Common Area:     min(w1, w2) × min(h1, h2) evaluated`);
+  }
+  if (packet.structureLikeness) {
+    console.log(`  Structure:       ${packet.structureLikeness.note}`);
+  }
   if (packet.pixelDiff.tripletImagePath) {
     console.log(`  Triplet:         ${packet.pixelDiff.tripletImagePath}`);
   }

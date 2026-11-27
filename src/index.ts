@@ -27,10 +27,19 @@ import {
   startStaticServer,
   type StaticServerInstance,
 } from "./server/static-host.js";
+import { NoiseMask } from "./diff/noise-mask.js";
+import {
+  extractSemanticSkeleton,
+  computeStructureLikeness,
+  checkHorizontalOverflow,
+} from "./diff/skeleton.js";
 
 export * from "./schema.js";
 export * from "./adapters/figwright.converter.js";
 export * from "./snapshot/manager.js";
+export * from "./diff/noise-mask.js";
+export * from "./diff/similarity.js";
+export * from "./diff/skeleton.js";
 export { launchBrowser, resolveBrowserExecutable } from "./browser/resolver.js";
 export {
   startDaemon,
@@ -129,6 +138,7 @@ export async function check(
       : (refResult.inferredDpr || config.viewport.deviceScaleFactor);
 
     // 3. Navigate to Live Target Page in an isolated BrowserContext
+    // Phase 1.2: Environment normalization (deviceScaleFactor, light colorScheme, no forced colors)
     targetContext = await browser.newContext({
       viewport: {
         width: config.viewport.width,
@@ -136,6 +146,8 @@ export async function check(
       },
       deviceScaleFactor: initialDpr,
       ignoreHTTPSErrors: config.ignoreHttpsErrors,
+      colorScheme: "light",
+      forcedColors: "none",
     });
 
     const page = await targetContext.newPage();
@@ -143,6 +155,13 @@ export async function check(
 
     if (config.injectCss) {
       await page.addStyleTag({ content: config.injectCss });
+    }
+
+    // Phase 1.2: Close interfering modals/cookie banners with Escape before capture
+    try {
+      await page.keyboard.press("Escape");
+    } catch {
+      // Ignore
     }
 
     // 4. Extract Live Page Telemetry, Mask Rects & Live Screenshot
@@ -179,6 +198,8 @@ export async function check(
           viewport: { width: config.viewport.width, height: config.viewport.height },
           deviceScaleFactor: 1,
           ignoreHTTPSErrors: config.ignoreHttpsErrors,
+          colorScheme: "light",
+          forcedColors: "none",
         });
         try {
           const p1x = await ctx1x.newPage();
@@ -195,6 +216,48 @@ export async function check(
         } finally {
           await ctx1x.close();
         }
+      }
+    }
+
+    // Phase 1.1: Triple-shot noise masking (--auto-noise-mask)
+    let noiseMask: NoiseMask | undefined;
+    if (config.autoNoiseMask) {
+      try {
+        const rawShot1 = await sharp(liveScreenshotPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        await page.waitForTimeout(900);
+        const shot2Buffer = await page.locator(config.selector).first().screenshot({
+          animations: "allow",
+          caret: "hide",
+          scale: "device",
+        });
+        const rawShot2 = await sharp(shot2Buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        await page.waitForTimeout(1300);
+        const shot3Buffer = await page.locator(config.selector).first().screenshot({
+          animations: "allow",
+          caret: "hide",
+          scale: "device",
+        });
+        const rawShot3 = await sharp(shot3Buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+
+        const mask1 = NoiseMask.betweenRaw(
+          { width: rawShot1.info.width, height: rawShot1.info.height, data: rawShot1.data, channels: 4 },
+          { width: rawShot2.info.width, height: rawShot2.info.height, data: rawShot2.data, channels: 4 },
+          config.noiseThreshold
+        );
+        const mask2 = NoiseMask.betweenRaw(
+          { width: rawShot1.info.width, height: rawShot1.info.height, data: rawShot1.data, channels: 4 },
+          { width: rawShot3.info.width, height: rawShot3.info.height, data: rawShot3.data, channels: 4 },
+          config.noiseThreshold
+        );
+        noiseMask = mask1.union(mask2);
+        if (noiseMask.count() > 0) {
+          const noisePngPath = path.join(outputDir, "noise.png");
+          const pngBuf = await noiseMask.toPng();
+          fs.writeFileSync(noisePngPath, pngBuf);
+        }
+      } catch (err) {
+        console.error("Triple-shot error:", err);
+        // Fall back gracefully if triple-shot fails
       }
     }
 
@@ -252,16 +315,43 @@ export async function check(
         adapter: effectiveAdapter,
         subpixelTolerancePx: config.subpixelTolerancePx,
         liveNodes: liveTelemetry.nodes,
+        commonArea: config.commonArea,
+        noiseMask,
       }
     );
 
+    if (noiseMask && noiseMask.count() > 0) {
+      pixelDiff.noiseMaskFile = path.join(outputDir, "noise.png");
+    }
+
+    const tripletRef = pixelDiff.commonAreaApplied ? path.join(outputDir, "ref_cropped.png") : refResult.refScreenshotPath;
+    const tripletLive = pixelDiff.commonAreaApplied ? path.join(outputDir, "live_cropped.png") : liveScreenshotPath;
+
     await generateTripletImage(
-      refResult.refScreenshotPath,
-      liveScreenshotPath,
+      tripletRef,
+      tripletLive,
       diffOutputPath,
       tripletOutputPath
     );
     pixelDiff.tripletImagePath = tripletOutputPath;
+
+    // Phase 3.1: Horizontal scroll overflow check
+    const overflowCheck = checkHorizontalOverflow(
+      liveTelemetry.scrollWidth || config.viewport.width,
+      liveTelemetry.viewportWidth || config.viewport.width
+    );
+
+    // Phase 3.2: Semantic Skeleton LCS comparison
+    const refSkeleton = extractSemanticSkeleton(refResult.spec.nodes);
+    const liveSkeleton =
+      liveTelemetry.semanticSkeleton || extractSemanticSkeleton(liveTelemetry.nodes);
+    const structureLikeness =
+      refSkeleton.length > 0 ? computeStructureLikeness(refSkeleton, liveSkeleton) : undefined;
+
+    const warnings: string[] = [...(refResult.warnings || [])];
+    if (overflowCheck.overflow && overflowCheck.hint) {
+      warnings.push(overflowCheck.hint);
+    }
 
     const durationMs = Date.now() - startTime;
     const isPass =
@@ -299,9 +389,15 @@ export async function check(
       geometryViolations,
       pixelDiff,
       summary,
-      ...(refResult.warnings && refResult.warnings.length > 0
-        ? { warnings: refResult.warnings }
-        : {}),
+      structureLikeness,
+      horizontalOverflow: {
+        overflow: overflowCheck.overflow,
+        scrollWidth: liveTelemetry.scrollWidth || config.viewport.width,
+        viewportWidth: liveTelemetry.viewportWidth || config.viewport.width,
+        delta: overflowCheck.delta,
+        ...(overflowCheck.hint ? { hint: overflowCheck.hint } : {}),
+      },
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
 
     return DeltaPacketSchema.parse(deltaPacket);

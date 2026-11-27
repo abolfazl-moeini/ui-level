@@ -9,12 +9,14 @@ export interface PaddedDimensionsResult {
   refDimensions: { width: number; height: number };
   liveDimensions: { width: number; height: number };
   unifiedDimensions: { width: number; height: number };
+  commonAreaApplied?: boolean;
 }
 
 export async function normalizeImageDimensions(
   refImagePath: string,
   liveImagePath: string,
-  outputDir: string
+  outputDir: string,
+  options?: { commonArea?: boolean }
 ): Promise<PaddedDimensionsResult> {
   const refMeta = await sharp(refImagePath).metadata();
   const liveMeta = await sharp(liveImagePath).metadata();
@@ -37,6 +39,35 @@ export async function normalizeImageDimensions(
       refDimensions,
       liveDimensions,
       unifiedDimensions: refDimensions,
+    };
+  }
+
+  // Phase 1.3: If commonArea is requested, crop to the overlapping area min(w1, w2) x min(h1, h2)
+  if (options?.commonArea) {
+    const minW = Math.min(refW, liveW);
+    const minH = Math.min(refH, liveH);
+    fs.mkdirSync(outputDir, { recursive: true });
+    const croppedRefPath = path.join(outputDir, "ref_cropped.png");
+    const croppedLivePath = path.join(outputDir, "live_cropped.png");
+
+    await sharp(refImagePath)
+      .extract({ left: 0, top: 0, width: minW, height: minH })
+      .png()
+      .toFile(croppedRefPath);
+
+    await sharp(liveImagePath)
+      .extract({ left: 0, top: 0, width: minW, height: minH })
+      .png()
+      .toFile(croppedLivePath);
+
+    return {
+      refPath: croppedRefPath,
+      livePath: croppedLivePath,
+      dimensionDrift: false,
+      refDimensions,
+      liveDimensions,
+      unifiedDimensions: { width: minW, height: minH },
+      commonAreaApplied: true,
     };
   }
 

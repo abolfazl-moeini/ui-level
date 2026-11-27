@@ -68,6 +68,7 @@ export const NodeSpecSchema = z.object({
   mappedRefIds: z.array(z.string()).optional(),
   selector: z.string(),
   tagName: z.string().optional(),
+  role: z.string().optional(),
   classes: z.array(z.string()).optional(),
   direction: z.enum(["ltr", "rtl"]).optional(),
   rect: GeometryRectSchema,
@@ -150,6 +151,11 @@ export const PixelDiffSummarySchema = z.object({
   tripletImagePath: z.string().optional(),
   diffImagePath: z.string().optional(),
   regions: z.array(DiffRegionSchema).optional(),
+  layoutSimilarity: z.number().min(0).max(1).optional(),
+  perceptualSimilarity: z.number().min(0).max(1).optional(),
+  noiseMaskFile: z.string().optional(),
+  noiseTiles: z.number().int().nonnegative().optional(),
+  commonAreaApplied: z.boolean().optional(),
 });
 
 export type PixelDiffSummary = z.infer<typeof PixelDiffSummarySchema>;
@@ -205,6 +211,22 @@ export const DeltaPacketSchema = z.object({
   geometryViolations: z.array(GeometryViolationSchema),
   pixelDiff: PixelDiffSummarySchema,
   summary: z.string(),
+  structureLikeness: z
+    .object({
+      similarity: z.number(),
+      missing: z.array(z.object({ name: z.string(), count: z.number() })),
+      note: z.string(),
+    })
+    .optional(),
+  horizontalOverflow: z
+    .object({
+      overflow: z.boolean(),
+      scrollWidth: z.number(),
+      viewportWidth: z.number(),
+      delta: z.number(),
+      hint: z.string().optional(),
+    })
+    .optional(),
   warnings: z.array(z.string()).optional(),
 });
 
@@ -234,6 +256,9 @@ export const ConfigSchema = z.object({
   outputDir: z.string().default(".ui-level"),
   refSpec: z.string().optional(),
   refImage: z.string().optional(),
+  autoNoiseMask: z.boolean().default(false),
+  commonArea: z.boolean().default(false),
+  noiseThreshold: z.number().int().min(0).max(255).default(24),
   figma: z
     .object({
       token: z.string().optional(),
