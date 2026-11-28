@@ -49,6 +49,8 @@ export {
   getDaemonSocketPath,
 } from "./browser/daemon.js";
 export { startStaticServer } from "./server/static-host.js";
+export * from "./lint/dom-layout-lint.js";
+export * from "./evidence/trimmer.js";
 
 export async function check(
   userConfig: UserUILevelConfig = {},

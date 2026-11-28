@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -7,6 +8,8 @@ import type { Browser } from "playwright-core";
 import { check } from "../index.js";
 import { launchBrowser, resolveBrowserExecutable } from "../browser/resolver.js";
 import { importReferenceSnapshot } from "../snapshot/manager.js";
+import { runDomLayoutLint } from "../lint/dom-layout-lint.js";
+import { findProjectRoot, startStaticServer } from "../server/static-host.js";
 
 export const McpImportSnapshotSchema = z.object({
   slug: z.string().min(1),
@@ -53,7 +56,7 @@ export async function startMcpServer(): Promise<void> {
   const server = new Server(
     {
       name: "ui-level",
-      version: "1.2.0",
+      version: "1.3.0",
     },
     {
       capabilities: {
@@ -243,6 +246,32 @@ export async function startMcpServer(): Promise<void> {
             properties: {},
           },
         },
+        {
+          name: "level_lint",
+          description:
+            "Run standalone DOM & layout semantic lint (RTL direction, loaded webfont check, horizontal overflow, container clipping/overflow, and in-flow sibling overlap).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              targetUrl: { type: "string", description: "Target URL or local HTML file path" },
+              root: { type: "string", description: "Optional project root for local files" },
+              expectedDir: { type: "string", enum: ["rtl", "ltr"], default: "rtl" },
+              expectedFontFamily: { type: "string" },
+              viewport: {
+                type: "object",
+                properties: {
+                  width: { type: "number" },
+                  height: { type: "number" },
+                },
+              },
+              containers: { type: "array", items: { type: "string" } },
+              siblingGroups: { type: "array", items: { type: "string" } },
+              ignoreOverlapSelectors: { type: "array", items: { type: "string" } },
+              tolerancePx: { type: "number" },
+            },
+            required: ["targetUrl"],
+          },
+        },
       ],
     };
   });
@@ -315,6 +344,55 @@ export async function startMcpServer(): Promise<void> {
           isError: true,
           content: [{ type: "text", text: `Check error: ${err?.message || "unknown"}` }],
         };
+      }
+    }
+
+    if (name === "level_lint") {
+      let serverInstance;
+      let context;
+      try {
+        const input = (args || {}) as Record<string, any>;
+        let targetUrl = String(input.targetUrl || "");
+        if (!targetUrl) {
+          throw new Error("targetUrl is required");
+        }
+        const isRemote =
+          targetUrl.startsWith("http://") ||
+          targetUrl.startsWith("https://") ||
+          targetUrl.startsWith("data:");
+        if (!isRemote) {
+          if (!fs.existsSync(path.resolve(targetUrl))) {
+            throw new Error(`Target HTML file not found: ${targetUrl}`);
+          }
+          const projectRoot = findProjectRoot(targetUrl, input.root);
+          serverInstance = await startStaticServer(projectRoot);
+          targetUrl = serverInstance.getUrlForFile(targetUrl);
+        }
+        const browser = await getBrowser();
+        context = await browser.newContext({
+          viewport: input.viewport || { width: 1440, height: 900 },
+        });
+        const page = await context.newPage();
+        await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 30000 });
+        const result = await runDomLayoutLint(page, {
+          expectedDir: input.expectedDir,
+          expectedFontFamily: input.expectedFontFamily,
+          containers: input.containers,
+          siblingGroups: input.siblingGroups,
+          ignoreOverlapSelectors: input.ignoreOverlapSelectors,
+          tolerancePx: input.tolerancePx,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err: any) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Lint error: ${err?.message || "unknown"}` }],
+        };
+      } finally {
+        if (context) await context.close().catch(() => {});
+        if (serverInstance) await serverInstance.close().catch(() => {});
       }
     }
 

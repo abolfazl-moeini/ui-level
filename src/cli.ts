@@ -4,6 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { check } from "./index.js";
 import { resolveBrowserExecutable, launchBrowser } from "./browser/resolver.js";
+import { runDomLayoutLint, type DomLayoutLintResult } from "./lint/dom-layout-lint.js";
+import { trimSuiteEvidence } from "./evidence/trimmer.js";
+import { findProjectRoot, startStaticServer, type StaticServerInstance } from "./server/static-host.js";
 import {
   isDaemonRunning,
   sendDaemonRequest,
@@ -105,7 +108,7 @@ async function ensureWarmDaemon(): Promise<boolean> {
 program
   .name("ui-level")
   .description("Deterministic visual & CSS spec regression engine for modern UI workflows")
-  .version("1.2.0");
+  .version("1.3.0");
 
 program
   .command("check")
@@ -132,6 +135,7 @@ program
   .option("--auto-noise-mask", "Triple-shot noise masking to ignore animated/moving elements")
   .option("--common-area", "Compare overlapping common area min(w1, w2) x min(h1, h2)")
   .option("--daemon", "Use background daemon for sub-350ms warm execution")
+  .option("--compact", "Compact JSON output using trimSuiteEvidence")
   .option("--json", "Output pure JSON DeltaPacket to stdout")
   .action(async (options, cmd) => {
     try {
@@ -246,8 +250,8 @@ program
         result = await check(mergedConfig);
       }
 
-      if (options.json) {
-        console.log(JSON.stringify(result, null, 2));
+      if (options.json || options.compact) {
+        console.log(JSON.stringify(options.compact ? trimSuiteEvidence(result) : result, null, 2));
       } else {
         renderHumanReport(result);
       }
@@ -448,6 +452,100 @@ program
 const snapshotCmd = program
   .command("snapshot")
   .description("Manage immutable reference snapshot bundles");
+
+program
+  .command("lint")
+  .description("Run standalone DOM, RTL, font, overflow, and sibling-overlap layout lint")
+  .requiredOption("-t, --target <url|file>", "Target URL or local HTML file")
+  .option("--root <dir>", "Project root directory for local HTML files")
+  .option("--dir <rtl|ltr>", "Expected document reading direction", "rtl")
+  .option("--font <family>", "Expected loaded webfont family name")
+  .option("--viewport <list>", "Comma-separated viewports, e.g. 1440x900,440x900", "1440x900")
+  .option("--containers <css>", "Comma-separated container selectors to check child overflow")
+  .option("--sibling-groups <css>", "Comma-separated group selectors to check sibling overlap")
+  .option("--ignore-overlap <css>", "Comma-separated selectors allowed to overlap")
+  .option("--tolerance <px>", "Geometry tolerance in px", parseFloat)
+  .option("--json", "Output result as JSON")
+  .action(async (options) => {
+    let browser;
+    let server: StaticServerInstance | undefined;
+    try {
+      const splitCsv = (val?: string) =>
+        val
+          ? val
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : [];
+
+      const viewports = splitCsv(options.viewport).map(parseViewportFlag);
+      if (viewports.length === 0) {
+        throw new Error("At least one valid --viewport (e.g. 1440x900) is required.");
+      }
+      if (options.tolerance !== undefined && (Number.isNaN(options.tolerance) || options.tolerance < 0)) {
+        throw new Error("Invalid --tolerance value. Expected a non-negative number.");
+      }
+
+      let targetUrl: string = options.target;
+      const isRemote =
+        targetUrl.startsWith("http://") ||
+        targetUrl.startsWith("https://") ||
+        targetUrl.startsWith("data:");
+
+      if (!isRemote) {
+        if (!fs.existsSync(path.resolve(targetUrl))) {
+          throw new Error(`Target HTML file not found: ${targetUrl}`);
+        }
+        const projectRoot = findProjectRoot(targetUrl, options.root);
+        server = await startStaticServer(projectRoot);
+        targetUrl = server.getUrlForFile(targetUrl);
+      }
+
+      browser = await launchBrowser();
+      const page = await browser.newPage();
+      const results: Array<{ viewport: string; result: DomLayoutLintResult }> = [];
+
+      for (const vp of viewports) {
+        await page.setViewportSize({ width: vp.width, height: vp.height });
+        await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 30000 });
+        const result = await runDomLayoutLint(page, {
+          expectedDir: options.dir,
+          expectedFontFamily: options.font,
+          containers: splitCsv(options.containers),
+          siblingGroups: splitCsv(options.siblingGroups),
+          ...(options.ignoreOverlap ? { ignoreOverlapSelectors: splitCsv(options.ignoreOverlap) } : {}),
+          ...(options.tolerance !== undefined ? { tolerancePx: options.tolerance } : {}),
+        });
+        results.push({ viewport: `${vp.width}x${vp.height}`, result });
+      }
+
+      const ok = results.every((r) => r.result.ok);
+      if (options.json) {
+        console.log(JSON.stringify({ ok, target: options.target, results }, null, 2));
+      } else {
+        console.log(`\n=== ui-level DOM & Layout Lint: ${ok ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"} ===`);
+        for (const item of results) {
+          const r = item.result;
+          console.log(
+            `  [${item.viewport}] ${r.ok ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"} | dir=${r.rtl.dir} | font=${r.fonts.familyChecked ? `${r.fonts.familyChecked}:${r.fonts.familyAvailable}` : r.fonts.status} | hOverflow=${r.horizontalOverflow.ok ? "none" : `${r.horizontalOverflow.delta}px`} | containerViolations=${r.containerOverflows.length} | siblingOverlaps=${r.siblingOverlaps.length}`
+          );
+        }
+        console.log("");
+      }
+
+      process.exit(ok ? 0 : 1);
+    } catch (err: any) {
+      if (options.json) {
+        console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
+      } else {
+        console.error(`\x1b[31mLint failed: ${err.message}\x1b[0m`);
+      }
+      process.exit(2);
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      if (server) await server.close().catch(() => {});
+    }
+  });
 
 snapshotCmd
   .command("import")
